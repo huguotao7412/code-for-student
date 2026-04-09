@@ -12,10 +12,10 @@ def sanitize_and_stick(action: str, params: dict, element_map: dict) -> tuple:
         raw_x, raw_y = params["point"]
         final_x, final_y = clip(raw_x), clip(raw_y)
 
-        # 尝试吸附：如果点击点在某个识别到的元素 30 像素范围内，自动吸附到中心
+        # 【修改点】：将吸附阈值从 35 降低至 20 像素，提升在密集按键区（如键盘）的精度
         for idx, center in element_map.items():
             dist = ((final_x - center[0]) ** 2 + (final_y - center[1]) ** 2) ** 0.5
-            if dist < 35:
+            if dist <= 20:
                 final_x, final_y = center
                 break
 

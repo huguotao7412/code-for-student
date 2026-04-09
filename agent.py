@@ -1,17 +1,19 @@
 # 文件路径: agent.py
 from dotenv import load_dotenv
 load_dotenv()
-# 文件路径: src/agent.py
 import re
 import logging
 from typing import Tuple, Dict, Any, List
+from dotenv import load_dotenv
+
 from agent_base import BaseAgent, AgentOutput, AgentInput
-# 假设 utils.vision_enhancer 已经存在，用于给图片画网格
+# 假设 utils.vision_enhancer 已经存在
 from utils.vision_enhancer import add_coordinate_grid
 from utils.visual_memory import draw_previous_action
 from utils.ui_detector import draw_som_labels
 from utils.action_sandbox import sanitize_and_stick
 
+load_dotenv()
 logger = logging.getLogger(__name__)
 
 
@@ -29,11 +31,13 @@ class Agent(BaseAgent):
         """重置状态：无状态设计，无需重置历史"""
         pass
 
-    def _build_advanced_prompt(self, instruction: str) -> str:
+    # 【修复点 1】补全函数签名，增加 history_actions 参数
+    def _build_advanced_prompt(self, instruction: str, history_actions: List[Dict[str, Any]]) -> str:
         """
         构建基于标准操作程序 (SOP) 的强约束 Prompt
         """
-        last_action = history_actions[-1] if history_actions else "None"
+        # 【修复点 2】安全地获取 last_action，容错处理
+        last_action = history_actions[-1] if (history_actions and len(history_actions) > 0) else "None"
 
         return f"""你是一个高级 Android GUI 智能代理。目标：【{instruction}】
 
@@ -70,7 +74,7 @@ class Agent(BaseAgent):
         # 3. 叠加坐标网格
         enhanced_image = add_coordinate_grid(img)
 
-        # 4. 构建带反思内容的 Prompt
+        # 4. 构建带反思内容的 Prompt (此时参数对应已正确)
         final_prompt = self._build_advanced_prompt(input_data.instruction, input_data.history_actions)
 
         return [
@@ -95,10 +99,7 @@ class Agent(BaseAgent):
 
             return AgentOutput(action=action, parameters=params, raw_output=raw_output, usage=usage_info)
 
-        except Exception as e:
-            logger.error(f"[Agent Error]: {e}")
-            return AgentOutput(action="CLICK", parameters={"point": [500, 500]}, raw_output=str(e))
-
+        # 【修复点 3】删除了重复的 except Exception 块，保留一个规范的错误兜底
         except Exception as e:
             logger.error(f"[Agent Error]: {e}")
             # 安全兜底：如果 API 报错或解析彻底失败，默认点击中心点，防止脚本崩溃中断测试
@@ -112,8 +113,8 @@ class Agent(BaseAgent):
         """
         强壮的解析器，确保输出完全符合基类要求的常量格式
         """
-        # 提取 Action 后的文本
-        action_text = raw_text.split("Action:")[-1].strip() if "Action:" in raw_text else raw_text
+        # 提取 Action 后的文本，并去除多余空白
+        action_text = raw_text.split("Action:")[-1].strip() if "Action:" in raw_text else raw_text.strip()
 
         if 'COMPLETE' in action_text:
             return "COMPLETE", {}
@@ -129,13 +130,17 @@ class Agent(BaseAgent):
                 "end_point": [int(match_scroll.group(3)), int(match_scroll.group(4))]
             }
 
-        match_type = re.search(r'TYPE:\s*\[[\'"](.*?)[\'"]\]', action_text)
+        # 【修改点 1】：兼容 TYPE 缺失括号、单双引号混用、甚至中文引号的情况
+        # 能够成功匹配: TYPE:['内容'], TYPE:内容, TYPE:"内容", TYPE:['内容'] 等
+        match_type = re.search(r'TYPE:\s*\[?[\'\"‘“]?(.*?)[\'\"’”]?\]?$', action_text)
         if match_type:
-            return "TYPE", {"text": match_type.group(1)}
+            # .strip() 用于去除模型可能额外输出的前后空格
+            return "TYPE", {"text": match_type.group(1).strip()}
 
-        match_open = re.search(r'OPEN:\s*\[[\'"](.*?)[\'"]\]', action_text)
+        # 【修改点 2】：对 OPEN 也做同样的鲁棒性兼容
+        match_open = re.search(r'OPEN:\s*\[?[\'\"‘“]?(.*?)[\'\"’”]?\]?$', action_text)
         if match_open:
-            return "OPEN", {"app_name": match_open.group(1)}
+            return "OPEN", {"app_name": match_open.group(1).strip()}
 
-        # 最终兜底
+        # 最终兜底：防止程序崩溃
         return "CLICK", {"point": [500, 500]}
