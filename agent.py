@@ -1,72 +1,128 @@
+# 文件路径: agent.py
 import os
-from dotenv import load_dotenv
-load_dotenv()
-
 import re
 import logging
-from typing import Tuple, Dict, Any
+from typing import Tuple, Dict, Any, List
 from agent_base import BaseAgent, AgentOutput, AgentInput
+from utils.vision_enhancer import add_coordinate_grid
 
 logger = logging.getLogger(__name__)
 
 
 class Agent(BaseAgent):
     """
-    中兴捧月 GUI Agent 参赛类 - 基线试水版
-    核心目标：确保 API 调用成功，并使用正则安全解析坐标和动作，防止任何异常导致计分失败。
+    中兴捧月 GUI Agent - V2 增强版 (视觉网格 + 防死循环状态机 + Reflexion)
     """
 
     def _initialize(self):
-        """初始化内部状态"""
+        """初始化内部状态机"""
         self.step_history_text = []
 
+        # --- V2 新增：防死循环监控变量 ---
+        self.last_action_type = None
+        self.last_action_params = {}
+        self.consecutive_stuck_count = 0
+
     def reset(self):
-        """每个测试用例开始前重置状态"""
+        """每个测试用例开始前重置状态，满足评测器规范"""
         self.step_history_text.clear()
+        self.last_action_type = None
+        self.last_action_params = {}
+        self.consecutive_stuck_count = 0
 
-        def _build_system_prompt(self, instruction: str) -> str:
-            """
-            重写系统提示词，进一步强调输出格式。
-            """
-            return f"""You are an intelligent GUI Agent for mobile devices. 
-    Your task is to help the user complete the following instruction:
-    【{instruction}】
+    def _detect_loop(self, current_action: str, current_params: dict):
+        """
+        V2 新增：检测是否陷入了重复点击等死循环
+        在 1000x1000 坐标系下，如果连续点击的距离极近，视为卡死。
+        """
+        if current_action == self.last_action_type == "CLICK":
+            p_curr = current_params.get("point", [0, 0])
+            p_last = self.last_action_params.get("point", [0, 0])
 
-    Please observe the provided mobile screen screenshot. The screen coordinates are normalized to a 1000x1000 grid (x: 0-1000 from left to right, y: 0-1000 from top to bottom).
+            # 计算曼哈顿距离，如果在 50 (5%屏幕) 范围内，视为重复无效点击
+            dist = abs(p_curr[0] - p_last[0]) + abs(p_curr[1] - p_last[1])
+            if dist < 50:
+                self.consecutive_stuck_count += 1
+            else:
+                self.consecutive_stuck_count = 0
+        else:
+            self.consecutive_stuck_count = 0
 
-    You must output your thinking process in the "Thought" section, and your final action in the "Action" section.
-    For CLICK actions, provide a single center point [x, y]. DO NOT output bounding boxes like [x1, y1, x2, y2].
+        self.last_action_type = current_action
+        self.last_action_params = current_params
 
-    The Action MUST strictly match one of the following exact formats:
-    - CLICK:[[x, y]]
-    - TYPE:['text content']
-    - SCROLL:[[x1, y1], [x2, y2]]
-    - OPEN:['app name']
-    - COMPLETE:[]
+    def _build_advanced_prompt(self, instruction: str, history: List[str]) -> str:
+        """
+        构建带有动态警告和严格 Few-shot 的系统提示词
+        """
+        history_str = "\n".join(history) if history else "No previous actions. This is step 1."
 
-    Example output:
-    Thought: 我需要点击屏幕底部的“我的”标签，中心坐标大约在 x=800, y=950。
-    Action: CLICK:[[800, 950]]
-    """
+        # --- V2 新增：动态警告注入 ---
+        warning_block = ""
+        if self.consecutive_stuck_count >= 2:
+            warning_block = """
+🚨 [CRITICAL WARNING]: 
+You are repeating the SAME CLICK ACTION and making no progress! The UI element might be unclickable or you are stuck. 
+YOU MUST CHANGE YOUR STRATEGY NOW. Try to SCROLL the screen to find new elements, or click a completely different area!
+"""
+
+        return f"""You are an expert GUI Agent for mobile devices. 
+Your ultimate task is: 【{instruction}】
+
+[Image Information]
+The screen has a 10x10 red grid overlay. Each cell is 100x100 in the normalized 1000x1000 system. 
+X-axis: 0 (left) to 1000 (right). Y-axis: 0 (top) to 1000 (bottom).
+
+[Action History]
+{history_str}
+{warning_block}
+
+[Reasoning Protocol (ReAct)]
+You MUST formulate your step in the following strict order:
+Thought:
+- Observation: What changed after the last action? Is the target visible?
+- Plan: What is the single next move?
+- Coordinate Estimation: Use the grid to estimate X and Y.
+Action: <Exactly one action format>
+
+[Action Formats & STRICT Rules]
+1. CLICK:[[x, y]]  (e.g., CLICK:[[500, 150]])
+2. TYPE:['content'] 
+3. OPEN:['app name']
+4. COMPLETE:[]
+5. SCROLL:[[start_x, start_y], [end_x, end_y]]
+   -> RULE FOR SCROLLING: To scroll the page DOWN (see lower content), you must swipe UP. Example: SCROLL:[[500, 800], [500, 200]].
+
+Now, process the current screen and output your Thought and Action.
+"""
+
+    def generate_messages(self, input_data: AgentInput) -> List[Dict[str, Any]]:
+        # 给原图加上坐标网格 (依赖我们上一版的 utils/vision_enhancer.py)
+        enhanced_image = add_coordinate_grid(input_data.current_image)
+        final_prompt = self._build_advanced_prompt(input_data.instruction, self.step_history_text)
+
+        return [
+            {"role": "user", "content": [
+                {"type": "text", "text": final_prompt},
+                {"type": "image_url", "image_url": {"url": self._encode_image(enhanced_image)}}
+            ]}
+        ]
 
     def act(self, input_data: AgentInput) -> AgentOutput:
-        """
-        Agent 核心方法：根据输入生成动作
-        """
-        # 1. 生成包含历史消息的 messages
         messages = self.generate_messages(input_data)
 
         try:
-            # 2. 调用大模型 (使用温度 0.1 保证输出的确定性)
-            response = self._call_api(messages, temperature=0.1)
+            # 降低温度，追求极致的逻辑确定性
+            response = self._call_api(messages, temperature=0.0)
             raw_output = response.choices[0].message.content
             usage_info = self.extract_usage_info(response)
 
-            # 3. 使用鲁棒的正则表达式安全提取 action 和 parameters
             action, params = self._robust_parse(raw_output)
 
-            # 4. 记录纯文本历史（为后续多轮记忆做准备）
-            self.step_history_text.append(f"Action taken: {action}, Params: {params}")
+            # --- V2 新增：记录文本历史并进行死循环检测 ---
+            log_str = f"Step {input_data.step_count}: {action} {params}"
+            self.step_history_text.append(log_str)
+            self._detect_loop(action, params)
 
             return AgentOutput(
                 action=action,
@@ -76,69 +132,29 @@ class Agent(BaseAgent):
             )
 
         except Exception as e:
-            logger.error(f"[Agent Error] API调用或解析发生异常: {e}")
-            # 【安全兜底策略】如果发生任何异常，返回合法的空操作（这里用点击左上角盲区模拟）或者 COMPLETE，
-            # 绝对不要让 Agent 直接抛出异常，防止 test_runner 崩溃导致 0 分。
-            return AgentOutput(
-                action="CLICK",
-                parameters={"point": [0, 0]},
-                raw_output=f"Error Handled: {str(e)}"
-            )
+            logger.error(f"[Agent Error]: {e}")
+            # 异常兜底策略
+            return AgentOutput(action="CLICK", parameters={"point": [500, 500]}, raw_output=str(e))
 
     def _robust_parse(self, raw_text: str) -> Tuple[str, Dict[str, Any]]:
-        """
-        升级版鲁棒解析器：支持自动将 Bounding Box (4坐标) 转换为中心点 (2坐标)
-        并严格隔离 Thought 区域，防止误抓取数字。
-        """
-        # 1. 隔离干扰：只截取 Action: 后面的部分进行解析
-        action_text = raw_text
-        if "Action:" in raw_text:
-            action_text = raw_text.split("Action:")[-1].strip()
+        """保留上版本的安全解析器，它完全符合赛题要求的5种输出格式"""
+        action_text = raw_text.split("Action:")[-1].strip() if "Action:" in raw_text else raw_text
 
-        # 2. 增强型 CLICK 匹配（处理 GLM 喜欢输出 [x1, y1, x2, y2] 的习惯）
-        # 先尝试匹配 4 个数字的 Bounding Box
-        match_click_4 = re.search(r'CLICK:\s*\[?\[(\d+),\s*(\d+),\s*(\d+),\s*(\d+)\]\]?', action_text)
-        if match_click_4:
-            # 如果输出的是边界框，自动计算中心点！
-            x1, y1, x2, y2 = map(int, match_click_4.groups())
-            center_x = (x1 + x2) // 2
-            center_y = (y1 + y2) // 2
-            logger.info(f"✨ 自动将边界框 [{x1},{y1},{x2},{y2}] 转换为中心点 [{center_x},{center_y}]")
-            return "CLICK", {"point": [center_x, center_y]}
+        if 'COMPLETE' in action_text: return "COMPLETE", {}
 
-        # 再尝试匹配标准的 2 个数字的 Point
-        match_click_2 = re.search(r'CLICK:\s*\[?\[(\d+),\s*(\d+)\]\]?', action_text)
-        if match_click_2:
-            return "CLICK", {"point": [int(match_click_2.group(1)), int(match_click_2.group(2))]}
+        match_click = re.search(r'CLICK:\s*\[?\[(\d+),\s*(\d+)\]\]?', action_text)
+        if match_click: return "CLICK", {"point": [int(match_click.group(1)), int(match_click.group(2))]}
 
-        # 3. 匹配 SCROLL:[[x1, y1], [x2, y2]]
         match_scroll = re.search(r'SCROLL:\s*\[?\[(\d+),\s*(\d+)\],\s*\[(\d+),\s*(\d+)\]\]?', action_text)
-        if match_scroll:
-            return "SCROLL", {
-                "start_point": [int(match_scroll.group(1)), int(match_scroll.group(2))],
-                "end_point": [int(match_scroll.group(3)), int(match_scroll.group(4))]
-            }
+        if match_scroll: return "SCROLL", {
+            "start_point": [int(match_scroll.group(1)), int(match_scroll.group(2))],
+            "end_point": [int(match_scroll.group(3)), int(match_scroll.group(4))]
+        }
 
-        # 4. 匹配 TYPE:['内容'] 或 TYPE:["内容"]
         match_type = re.search(r'TYPE:\s*\[[\'"](.*?)[\'"]\]', action_text)
-        if match_type:
-            return "TYPE", {"text": match_type.group(1)}
+        if match_type: return "TYPE", {"text": match_type.group(1)}
 
-        # 5. 匹配 OPEN:['应用名']
         match_open = re.search(r'OPEN:\s*\[[\'"](.*?)[\'"]\]', action_text)
-        if match_open:
-            return "OPEN", {"app_name": match_open.group(1)}
+        if match_open: return "OPEN", {"app_name": match_open.group(1)}
 
-        # 6. 匹配 COMPLETE:[]
-        if 'COMPLETE' in action_text:
-            return "COMPLETE", {}
-
-        # 7. 终极兜底：如果还是没匹配上，只在 action_text (排除Thought) 中找数字
-        logger.warning(f"未能严格正则匹配，尝试从 Action 区域模糊推断: {action_text}")
-        if "CLICK" in action_text:
-            nums = re.findall(r'\d+', action_text)
-            if len(nums) >= 2:
-                return "CLICK", {"point": [int(nums[0]), int(nums[1])]}
-
-        # 最坏的情况，返回安全动作
-        return "COMPLETE", {}
+        return "CLICK", {"point": [500, 500]}
