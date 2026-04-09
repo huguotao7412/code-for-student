@@ -1,11 +1,12 @@
 # 文件路径: agent.py
-import os
 from dotenv import load_dotenv
 load_dotenv()
+# 文件路径: src/agent.py
 import re
 import logging
 from typing import Tuple, Dict, Any, List
 from agent_base import BaseAgent, AgentOutput, AgentInput
+# 假设 utils.vision_enhancer 已经存在，用于给图片画网格
 from utils.vision_enhancer import add_coordinate_grid
 
 logger = logging.getLogger(__name__)
@@ -13,95 +14,66 @@ logger = logging.getLogger(__name__)
 
 class Agent(BaseAgent):
     """
-    中兴捧月 GUI Agent - V2 增强版 (视觉网格 + 防死循环状态机 + Reflexion)
+    符合中兴捧月赛题规范的 GUI Agent
+    采用无状态设计 + 强 SOP 约束
     """
 
     def _initialize(self):
-        """初始化内部状态机"""
-        self.step_history_text = []
-
-        # --- V2 新增：防死循环监控变量 ---
-        self.last_action_type = None
-        self.last_action_params = {}
-        self.consecutive_stuck_count = 0
+        """初始化方法"""
+        pass
 
     def reset(self):
-        """每个测试用例开始前重置状态，满足评测器规范"""
-        self.step_history_text.clear()
-        self.last_action_type = None
-        self.last_action_params = {}
-        self.consecutive_stuck_count = 0
+        """重置状态：无状态设计，无需重置历史"""
+        pass
 
-    def _detect_loop(self, current_action: str, current_params: dict):
+    def _build_advanced_prompt(self, instruction: str) -> str:
         """
-        V2 新增：检测是否陷入了重复点击等死循环
-        在 1000x1000 坐标系下，如果连续点击的距离极近，视为卡死。
+        构建基于标准操作程序 (SOP) 的强约束 Prompt
         """
-        if current_action == self.last_action_type == "CLICK":
-            p_curr = current_params.get("point", [0, 0])
-            p_last = self.last_action_params.get("point", [0, 0])
+        return f"""你是一个高级 Android 设备 GUI 智能代理。
+你的最终目标是完成任务：【{instruction}】
 
-            # 计算曼哈顿距离，如果在 50 (5%屏幕) 范围内，视为重复无效点击
-            dist = abs(p_curr[0] - p_last[0]) + abs(p_curr[1] - p_last[1])
-            if dist < 50:
-                self.consecutive_stuck_count += 1
-            else:
-                self.consecutive_stuck_count = 0
-        else:
-            self.consecutive_stuck_count = 0
+[屏幕与坐标系信息]
+提供的截图已叠加了相对坐标系网格。整个屏幕的坐标范围是 X:[0, 1000], Y:[0, 1000]。
+左上角为 [0, 0]，右下角为 [1000, 1000]。请利用网格粗略定位，然后结合 UI 元素中心点估算精确坐标。
 
-        self.last_action_type = current_action
-        self.last_action_params = current_params
+[Android 操作 SOP - 必须严格遵守]
+1. 【输入文本规范】：
+   - 绝不能在软键盘未弹出时直接使用 TYPE 动作。
+   - 如果你需要输入文字，请先检查屏幕底部是否有软键盘。如果没有，你的动作必须是 CLICK 点击目标输入框。
+   - 只有当软键盘已经显示在屏幕上，或者当前焦点明确在输入框内时，才能使用 TYPE 动作。
+2. 【确认与搜索规范】：
+   - 输入文字后，若需要触发搜索或确认，请 CLICK 键盘右下角的“搜索/回车”按钮，或页面上的“搜索”文本，不要试图寻找不存在的 ENTER 动作。
+3. 【任务完成规范】：
+   - 仔细审视当前截图，如果任务所要求的结果（例如：视频已开始播放、评论已发布、路线已规划、页面已打开）在当前截图中【已经明确呈现】，你必须立即输出 COMPLETE:[]。不要做任何多余操作。
+4. 【滚动规范】：
+   - 如果需要向下浏览内容，请执行向上滑动，格式推荐为：SCROLL:[[500, 800], [500, 200]]。
 
-    def _build_advanced_prompt(self, instruction: str, history: List[str]) -> str:
-        """
-        构建带有动态警告和严格 Few-shot 的系统提示词
-        """
-        history_str = "\n".join(history) if history else "No previous actions. This is step 1."
+[输出格式限制]
+请严格按照以下结构输出，先进行 Thought 分析，最后给出 Action：
 
-        # --- V2 新增：动态警告注入 ---
-        warning_block = ""
-        if self.consecutive_stuck_count >= 2:
-            warning_block = """
-🚨 [CRITICAL WARNING]: 
-You are repeating the SAME CLICK ACTION and making no progress! The UI element might be unclickable or you are stuck. 
-YOU MUST CHANGE YOUR STRATEGY NOW. Try to SCROLL the screen to find new elements, or click a completely different area!
-"""
-
-        return f"""You are an expert GUI Agent for mobile devices. 
-Your ultimate task is: 【{instruction}】
-
-[Image Information]
-The screen has a 10x10 red grid overlay. Each cell is 100x100 in the normalized 1000x1000 system. 
-X-axis: 0 (left) to 1000 (right). Y-axis: 0 (top) to 1000 (bottom).
-
-[Action History]
-{history_str}
-{warning_block}
-
-[Reasoning Protocol (ReAct)]
-You MUST formulate your step in the following strict order:
 Thought:
-- Observation: What changed after the last action? Is the target visible?
-- Plan: What is the single next move?
-- Coordinate Estimation: Use the grid to estimate X and Y.
-Action: <Exactly one action format>
+1. 任务进度：当前页面处于任务的哪个阶段？
+2. 视觉分析：页面上关键 UI 元素在哪？软键盘处于什么状态？
+3. 下一步动作：基于上述 SOP，我当前这一步应该执行什么动作？
+4. 坐标计算：如果需要 CLICK 或 SCROLL，目标中心坐标 X 和 Y 分别是多少？
+Action: <仅限下方5种格式之一>
 
-[Action Formats & STRICT Rules]
-1. CLICK:[[x, y]]  (e.g., CLICK:[[500, 150]])
-2. TYPE:['content'] 
-3. OPEN:['app name']
-4. COMPLETE:[]
-5. SCROLL:[[start_x, start_y], [end_x, end_y]]
-   -> RULE FOR SCROLLING: To scroll the page DOWN (see lower content), you must swipe UP. Example: SCROLL:[[500, 800], [500, 200]].
-
-Now, process the current screen and output your Thought and Action.
+合法的 Action 格式（必须严格匹配，不要随意编造）：
+CLICK:[[x, y]]
+TYPE:['需要输入的文本']
+SCROLL:[[start_x, start_y], [end_x, end_y]]
+OPEN:['应用名称']
+COMPLETE:[]
 """
 
     def generate_messages(self, input_data: AgentInput) -> List[Dict[str, Any]]:
-        # 给原图加上坐标网格 (依赖我们上一版的 utils/vision_enhancer.py)
+        """覆盖基类的消息生成方法"""
+        # 给图片添加网格（此步骤极大地提升了模型预测坐标的准确率）
         enhanced_image = add_coordinate_grid(input_data.current_image)
-        final_prompt = self._build_advanced_prompt(input_data.instruction, self.step_history_text)
+
+        # 摒弃历史消息，使用无状态的强约束 Prompt
+        final_prompt = self._build_advanced_prompt(input_data.instruction)
 
         return [
             {"role": "user", "content": [
@@ -111,20 +83,17 @@ Now, process the current screen and output your Thought and Action.
         ]
 
     def act(self, input_data: AgentInput) -> AgentOutput:
+        """核心动作执行方法，符合基类调用规范"""
         messages = self.generate_messages(input_data)
 
         try:
-            # 降低温度，追求极致的逻辑确定性
+            # 使用基类受保护的方法调用 API，严格遵循规则，不传入敏感 kwargs
+            # temperature 设为 0.0 以获得稳定的格式输出
             response = self._call_api(messages, temperature=0.0)
             raw_output = response.choices[0].message.content
             usage_info = self.extract_usage_info(response)
 
             action, params = self._robust_parse(raw_output)
-
-            # --- V2 新增：记录文本历史并进行死循环检测 ---
-            log_str = f"Step {input_data.step_count}: {action} {params}"
-            self.step_history_text.append(log_str)
-            self._detect_loop(action, params)
 
             return AgentOutput(
                 action=action,
@@ -135,28 +104,41 @@ Now, process the current screen and output your Thought and Action.
 
         except Exception as e:
             logger.error(f"[Agent Error]: {e}")
-            # 异常兜底策略
-            return AgentOutput(action="CLICK", parameters={"point": [500, 500]}, raw_output=str(e))
+            # 安全兜底：如果 API 报错或解析彻底失败，默认点击中心点，防止脚本崩溃中断测试
+            return AgentOutput(
+                action="CLICK",
+                parameters={"point": [500, 500]},
+                raw_output=f"Error occurred: {str(e)}"
+            )
 
     def _robust_parse(self, raw_text: str) -> Tuple[str, Dict[str, Any]]:
-        """保留上版本的安全解析器，它完全符合赛题要求的5种输出格式"""
+        """
+        强壮的解析器，确保输出完全符合基类要求的常量格式
+        """
+        # 提取 Action 后的文本
         action_text = raw_text.split("Action:")[-1].strip() if "Action:" in raw_text else raw_text
 
-        if 'COMPLETE' in action_text: return "COMPLETE", {}
+        if 'COMPLETE' in action_text:
+            return "COMPLETE", {}
 
         match_click = re.search(r'CLICK:\s*\[?\[(\d+),\s*(\d+)\]\]?', action_text)
-        if match_click: return "CLICK", {"point": [int(match_click.group(1)), int(match_click.group(2))]}
+        if match_click:
+            return "CLICK", {"point": [int(match_click.group(1)), int(match_click.group(2))]}
 
         match_scroll = re.search(r'SCROLL:\s*\[?\[(\d+),\s*(\d+)\],\s*\[(\d+),\s*(\d+)\]\]?', action_text)
-        if match_scroll: return "SCROLL", {
-            "start_point": [int(match_scroll.group(1)), int(match_scroll.group(2))],
-            "end_point": [int(match_scroll.group(3)), int(match_scroll.group(4))]
-        }
+        if match_scroll:
+            return "SCROLL", {
+                "start_point": [int(match_scroll.group(1)), int(match_scroll.group(2))],
+                "end_point": [int(match_scroll.group(3)), int(match_scroll.group(4))]
+            }
 
         match_type = re.search(r'TYPE:\s*\[[\'"](.*?)[\'"]\]', action_text)
-        if match_type: return "TYPE", {"text": match_type.group(1)}
+        if match_type:
+            return "TYPE", {"text": match_type.group(1)}
 
         match_open = re.search(r'OPEN:\s*\[[\'"](.*?)[\'"]\]', action_text)
-        if match_open: return "OPEN", {"app_name": match_open.group(1)}
+        if match_open:
+            return "OPEN", {"app_name": match_open.group(1)}
 
+        # 最终兜底
         return "CLICK", {"point": [500, 500]}
