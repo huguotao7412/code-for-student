@@ -1,5 +1,7 @@
 # 文件路径: agent.py
 import os
+from dotenv import load_dotenv
+load_dotenv()
 import re
 import logging
 from typing import Tuple, Dict, Any, List
