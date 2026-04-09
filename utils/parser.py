@@ -22,10 +22,12 @@ def robust_parse(raw_text: str) -> Tuple[str, Dict[str, Any]]:
         action_block = text.split("Action:")[-1]
 
     upper = action_block.upper()
+    if any(keyword in upper for keyword in ["COMPLETE", "完成", "结束", "已达成", "SUCCESS"]):
+        return "COMPLETE", {}
 
     # 只保留 TestRunner 支持的动作
-    if "COMPLETE" in upper:
-        return "COMPLETE", {}
+    if "ENTER" in upper:
+        return "ENTER", {}
 
     if "SCROLL" in upper:
         nums = re.findall(r"-?\d+", action_block)
@@ -53,6 +55,11 @@ def robust_parse(raw_text: str) -> Tuple[str, Dict[str, Any]]:
 
     if "CLICK" in upper:
         # 优先抓取第一个坐标对；允许括号、冒号、空格混排
+        exact_match = re.search(r"\[\s*(-?\d+)\s*,\s*(-?\d+)\s*\]", action_block)
+        if exact_match:
+            return "CLICK", {"point": [int(exact_match.group(1)), int(exact_match.group(2))]}
+
+        # 原有的提取逻辑作为兜底：抓取前两个数字
         click_nums = re.findall(r"-?\d+", action_block)
         if len(click_nums) >= 2:
             return "CLICK", {"point": [int(click_nums[0]), int(click_nums[1])]}

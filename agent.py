@@ -33,47 +33,47 @@ class Agent(BaseAgent):
         """TestRunner 每次运行新用例时调用，重置状态机"""
         self.state = GUIState(max_steps=45)
 
-    def _build_general_cot_prompt(self, instruction: str) -> str:
-        return self._build_cot_prompt(instruction)
-
     def _build_cot_prompt(self, instruction: str) -> str:
-        history_summary = self.state.get_summary()
-        plan_context = (
-            "这是任务的第一步。先判断要打开哪个应用，再决定是点击、输入还是滚动。"
-            if self.state.step_count == 0
-            else f"【全局计划宏图】:\n{self.state.global_plan}\n请根据当前进度继续执行。"
-        )
-        stuck_warning = ""
-        if self.state.stuck_level == 1:
-            stuck_warning = "\n[提示] 如果当前页面没有进展，先尝试滚动寻找目标。"
-        elif self.state.stuck_level >= 2:
-            stuck_warning = "\n[提示] 当前可能卡住了，优先尝试返回、关闭弹窗或换方向滚动。"
+            history_summary = self.state.get_summary()
+            plan_context = (
+                "这是任务的第一步。先判断要打开哪个应用，再决定是点击、输入还是滚动。"
+                if self.state.step_count == 0
+                else f"【全局计划宏图】:\n{self.state.global_plan}\n请根据当前进度继续执行。"
+            )
+            stuck_warning = ""
+            if self.state.stuck_level == 1:
+                stuck_warning = "\n[提示] 如果当前页面没有进展，先尝试滚动寻找目标。"
+            elif self.state.stuck_level >= 2:
+                stuck_warning = "\n[紧急警告] 任务已陷入死循环！必须立即尝试 SCROLL 或者 CLICK 返回！"
 
-        plan_line = "[Plan] 1. 识别应用和目标 2. 找到入口 3. 完成任务" if self.state.step_count == 0 else ""
-        return f"""你是一个高级 Android GUI 智能代理。
-任务目标：【{instruction}】
+            plan_line = "[Plan] 1. 识别应用 2. 找到入口 3. 完成任务" if self.state.step_count == 0 else ""
+            return f"""你是一个高级 Android GUI 智能代理。
+    任务目标：【{instruction}】
 
-[当前上下文]
-1. 历史动作: {history_summary}
-2. 当前进度: {self.state.step_count}/{self.state.max_steps}
-3. 截图已经叠加了 10x10 红线网格（宽[0-1000]，高[0-1000]）。
-4. {plan_context}{stuck_warning}
+    [当前上下文]
+    1. 历史动作: {history_summary}
+    2. 当前进度: {self.state.step_count}/{self.state.max_steps}
+    3. 【视觉提示】截图叠加了红线网格和数字标签。有标签直接估算标签中心坐标，没标签用网格估算。
+    4. {plan_context}{stuck_warning}
 
-[通用交互原则]
-- 遇到弹窗/广告/权限请求，优先点击关闭、跳过、同意或返回。
-- 需要输入时，先点击输入框，再 TYPE。
-- TYPE 时尽量保留任务中给出的**完整目标文本**，不要把长文本随意缩成关键词；只有在任务明确要求简写时才缩写。
-- TYPE 之后，如果界面上有搜索、确认、发送、完成之类的可见按钮，就优先点击那个按钮；不要输出 ENTER。
-- 如果当前页面偏离目标，优先尝试返回、关闭或滚动寻找目标。
+    [通用交互与动作原则]
+    - 【输入文字三步曲】：必须先 CLICK 输入框 -> TYPE 输入文字 -> 必须 ENTER 提交！
+    - 🛑 【绝对禁忌】：如果任务是“播放”、“收藏”、“查看”或“发布评论”，只要画面上【已经显示正在播放】、【按钮已亮起变色】或【内容已上屏显示】，这就是最终终点！绝对、绝对不允许再做任何点击或多余操作！直接交卷！
 
-请按以下结构输出，并且只输出一组动作决策：
-{plan_line}
-[Observation] 画面核心元素在哪？是否有弹窗？
-[Reflection] 上一步动作是否有效？如果无效，下一步应该换入口还是继续尝试？
-[Thought] 根据当前画面推导下一步动作。
-[Action] 只允许输出：CLICK:[[x, y]] / TYPE:['文本'] / SCROLL:[[x1, y1], [x2, y2]] / OPEN:['应用名'] / COMPLETE:[]
-[Expected Effect] 用一句话描述预期变化。
-"""
+    请按以下结构输出，并且只输出一组动作决策：
+    {plan_line}
+    [Observation] 灵魂拷问：任务的最终目的是什么？当前的画面状态是否已经达成了这个目的？（例如：要求播放，现在正在播放页面吗？要求收藏，现在收藏图标亮了吗？）
+    [Reflection] 如果Observation确认目标已达成，我必须停止一切操作！
+    [Thought] 明确写出：“目标已达成，我要输出 COMPLETE” 或 “目标未达成，我需要继续操作”。
+    [Action] 只允许输出以下六种之一：
+    CLICK:[[x, y]]
+    TYPE:['文本']
+    ENTER:[]
+    SCROLL:[[x1, y1], [x2, y2]]
+    OPEN:['应用名']
+    COMPLETE:[]
+    [Expected Effect] 预期变化。
+    """
 
     def _parse_with_effect(self, raw_text: str) -> Tuple[str, Dict[str, Any], str]:
         action_block = raw_text
@@ -170,6 +170,18 @@ class Agent(BaseAgent):
             return AgentOutput(action="COMPLETE", parameters={}, raw_output="Force stop limit reached")
 
         img, element_map = draw_som_labels(input_data.current_image)
+        original_width, original_height = input_data.current_image.size
+        normalized_element_map = {}
+        if element_map:
+            for idx, center in element_map.items():
+                if isinstance(center, (list, tuple)) and len(center) == 2:
+                    # 将 x 和 y 分别映射到 0-1000
+                    nx = int((center[0] / original_width) * 1000)
+                    ny = int((center[1] / original_height) * 1000)
+                    normalized_element_map[idx] = [nx, ny]
+
+        # 将归一化后的 map 覆盖原本的 element_map，确保后续所有吸附逻辑(Sticky Click)都在同一个维度
+        element_map = normalized_element_map
         img = draw_previous_action(img, input_data.history_actions)
         img = add_coordinate_grid(img)
 
