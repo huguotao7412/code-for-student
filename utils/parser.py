@@ -22,21 +22,7 @@ def robust_parse(raw_text: str) -> Tuple[str, Dict[str, Any]]:
         action_block = text.split("Action:")[-1]
 
     upper = action_block.upper()
-    if any(keyword in upper for keyword in ["COMPLETE", "完成", "结束", "已达成", "SUCCESS"]):
-        return "COMPLETE", {}
-
-    # 只保留 TestRunner 支持的动作
-    if "ENTER" in upper:
-        return "ENTER", {}
-
-    if "SCROLL" in upper:
-        nums = re.findall(r"-?\d+", action_block)
-        if len(nums) >= 4:
-            return "SCROLL", {
-                "start_point": [int(nums[0]), int(nums[1])],
-                "end_point": [int(nums[2]), int(nums[3])]
-            }
-
+    # 1. 优先提取 TYPE，防止因为 TYPE 文本里包含敏感词（如“完成”）导致误判
     if "TYPE" in upper:
         type_match = re.search(r"TYPE.*?['\"](.*?)['\"]", action_block, re.IGNORECASE)
         if type_match:
@@ -45,25 +31,42 @@ def robust_parse(raw_text: str) -> Tuple[str, Dict[str, Any]]:
         if type_tail:
             return "TYPE", {"text": type_tail.group(1).strip()}
 
+    # 2. 精确拦截 COMPLETE 及 ENTER
+    if "COMPLETE" in upper:
+        return "COMPLETE", {}
+
+    if "ENTER" in upper:
+        return "ENTER", {}
+
+    # 3. 继续提取 SCROLL
+    if "SCROLL" in upper:
+        nums = re.findall(r"-?\d+", action_block)
+        if len(nums) >= 4:
+            return "SCROLL", {
+                "start_point": [int(nums[0]), int(nums[1])],
+                "end_point": [int(nums[2]), int(nums[3])]
+            }
+
+    # 4. 继续提取 OPEN
     if "OPEN" in upper:
         open_match = re.search(r"OPEN.*?['\"](.*?)['\"]", action_block, re.IGNORECASE)
         if open_match:
             return "OPEN", {"app_name": open_match.group(1)}
-        app_match = re.search(r"OPEN\s*[:=]\s*\{?\s*'?app(?:_name)?'?\s*[:=]\s*['\"]?(.*?)['\"]?\s*}?", action_block, re.IGNORECASE)
+        app_match = re.search(r"OPEN\s*[:=]\s*\{?\s*'?app(?:_name)?'?\s*[:=]\s*['\"]?(.*?)['\"]?\s*}?", action_block,
+                              re.IGNORECASE)
         if app_match:
             return "OPEN", {"app_name": app_match.group(1).strip()}
 
+    # 5. 最后提取 CLICK
     if "CLICK" in upper:
-        # 优先抓取第一个坐标对；允许括号、冒号、空格混排
         exact_match = re.search(r"\[\s*(-?\d+)\s*,\s*(-?\d+)\s*\]", action_block)
         if exact_match:
             return "CLICK", {"point": [int(exact_match.group(1)), int(exact_match.group(2))]}
 
-        # 原有的提取逻辑作为兜底：抓取前两个数字
         click_nums = re.findall(r"-?\d+", action_block)
         if len(click_nums) >= 2:
             return "CLICK", {"point": [int(click_nums[0]), int(click_nums[1])]}
 
-    # 4. 终极兜底：防止解析异常导致评测脚本崩溃得 0 分
+    # 兜底
     logger.warning(f"[解析失败兜底] 原始输出: {action_block}")
     return "CLICK", {"point": [500, 500]}

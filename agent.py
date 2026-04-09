@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 class Agent(BaseAgent):
     """通用 GUI Agent：模型优先，失败时使用通用兜底策略。"""
 
-    VALID_ACTIONS = {"CLICK", "SCROLL", "TYPE", "OPEN", "COMPLETE"}
+    VALID_ACTIONS = {"CLICK", "SCROLL", "TYPE", "OPEN", "COMPLETE", "ENTER"}
 
     def _initialize(self):
         """初始化全局状态"""
