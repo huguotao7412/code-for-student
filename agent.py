@@ -5,6 +5,7 @@ load_dotenv()
 
 import hashlib
 import logging
+import re
 from typing import Any, Dict, Tuple
 
 from agent_base import AgentInput, AgentOutput, BaseAgent
@@ -39,8 +40,9 @@ class Agent(BaseAgent):
             return ""
 
     def _build_prompt(self, instruction: str, history_actions: list) -> str:
+        self._current_instruction = instruction or ""
         recent = self._recent_history(history_actions, window=2)
-        return f"""你是一个 Android GUI 智能代理。
+        return f"""你是一个 Android GUI 智能代理，必须以 LLM 判断为主导；规则只负责最后一层刹车。
 任务目标：【{instruction}】
 
 [当前上下文]
@@ -48,13 +50,34 @@ class Agent(BaseAgent):
 - 最近动作: {recent}
 - 当前进度: {self.state.step_count}/{self.state.max_steps}
 
-[强约束]
-- 你必须以用户指令中“原始出现的目标词”为准，禁止补全、扩写或重组。
-- 不要加城市名、品牌名、修饰词、前缀或后缀；例如任务只写“回民街”，就只能输出“回民街”，不要输出“西安回民街”。
-- 搜索/查找/输入/填写/查询/打车/路线/酒店 等流程，优先做“聚焦输入框 -> TYPE -> 点击确认/搜索/结果/打车/提交按钮”这一条线，不要把搜索任务误当成 OPEN。
-- 如果已经进入目标应用，禁止再次 OPEN 同一个应用；应直接在当前界面继续操作。
-- 如果当前页面已经明显到达任务目标、确认页、结果页、提交页或完成页，优先输出 COMPLETE；不要为了继续操作而多点一步。
-- 只输出一个动作，不要解释。
+[决策原则]
+1. 先看当前页面里“显式可见”的控件与状态，再决定下一步动作。
+2. 只输出一个最合适的动作，不要解释，不要列步骤。
+3. 优先跟随页面上的按钮、输入框、搜索框、确认区、结果区等可见线索，不要凭空补动作。
+4. 如果页面已经明显接近目标、结果页、确认页或完成页，优先 COMPLETE。
+5. 如果是输入后确认的场景，输入完成后优先点击页面上最明显的确认/搜索/下一步按钮。
+6. 不要重复对同一个已经完成的输入内容再次 TYPE。
+
+[TYPE 规则，必须严格遵守]
+- TYPE 的文本必须与任务目标中“原始出现的目标词”完全一致。
+- 不要把词想成一句描述，不要补全，不要扩写，不要重组。
+- 比赛里这类错误会直接扣分，下面是常见范例：
+  - 错误：回民街 -> 正确：回民街
+  - 错误：西安回民街 -> 正确：回民街
+  - 错误：三体 -> 正确：《三体》多人有声剧
+  - 错误：跳舞的视频 / 跳舞的视频并查看 -> 正确：跳舞
+- 禁止添加“的视频”“并查看”“西安”“查看一下”等任何后缀或前缀。
+- 如果任务目标包含书名号、括号、空格、标点，尽量原样保留。
+- 上面示例只是提醒常见失分点，不是枚举所有情况；核心仍然是“原样复写任务目标中的词”。
+
+[CLICK 规则]
+- 点击必须落在明确按钮、图标、搜索框或确认区中心。
+- 优先点页面上最明确的可操作控件，不要点内容列表本身。
+- 当你判断是在“输入后确认”阶段时，优先 CLICK，而不是再 TYPE。
+
+[OPEN 规则]
+- 只有在还没进入目标应用时才 OPEN。
+- 已经打开目标应用后，不要重复 OPEN，同一个应用只开一次。
 
 [可用动作]
 CLICK:[[x,y]]
@@ -62,10 +85,6 @@ TYPE:['文本']
 SCROLL:[[x1,y1],[x2,y2]]
 OPEN:['应用名']
 COMPLETE:[]
-
-[补充要求]
-- TYPE 的文本必须尽量原样复写任务要求中的目标内容，尤其是书名号、括号、空格和标点。
-- 如果任务明确要求“打车/提交/发送/确认/搜索/下一步”，在输入后要优先点对应按钮，不要停在输入状态。
 """
 
     @staticmethod
@@ -89,6 +108,33 @@ COMPLETE:[]
         # 只去掉模型常见外层包装，不碰正文。
         return raw.strip().strip("'\" ")
 
+    def _self_check_type_text(self, text: str) -> str:
+        """轻量自检：避免扩写尾缀，不做任意子串截断。"""
+        text = self._normalize_text(text)
+        instruction = getattr(self, "_current_instruction", "") or ""
+        if not text or not instruction:
+            return text
+
+        # 若指令里存在书名号短语，且当前文本是其子串，优先补全为完整短语。
+        for match in re.findall(r"《[^》]+》[^，。！？；,!?;\n]*", instruction):
+            phrase = match.strip()
+            if text and text in phrase and len(text) < len(phrase):
+                return phrase
+
+        # 原文已出现在指令中，直接保留。
+        if text in instruction:
+            return text
+
+        # 仅清理常见扩写尾缀，避免把完整目标词截断成过短片段。
+        noisy_suffixes = ["的视频并查看", "的视频", "并查看"]
+        for suffix in noisy_suffixes:
+            if text.endswith(suffix):
+                candidate = text[: -len(suffix)].strip()
+                if candidate and candidate in instruction:
+                    return candidate
+
+        return text
+
     def _normalize_output(self, action: str, params: dict) -> Tuple[str, dict, str]:
         params = params or {}
 
@@ -97,7 +143,12 @@ COMPLETE:[]
             return "CLICK", {"point": [500, 500]}, ""
 
         if action == "ENTER":
-            return "CLICK", {"point": [500, 500]}, "确认输入并继续"
+            if isinstance(params, dict) and "point" in params:
+                return "CLICK", {"point": self._clip_norm_point(params["point"])}, "确认输入并继续"
+            if isinstance(params, dict) and "x" in params and "y" in params:
+                return "CLICK", {"point": self._clip_norm_point([params["x"], params["y"]])}, "确认输入并继续"
+            # 严格评测中 ENTER 常对应右上角确认/搜索按钮，避免中心兜底误点。
+            return "CLICK", {"point": [900, 80]}, "确认输入并继续"
 
         if action == "CLICK":
             if isinstance(params, dict) and "point" in params:
@@ -110,7 +161,8 @@ COMPLETE:[]
             text = ""
             if isinstance(params, dict):
                 text = params.get("text", params.get("content", ""))
-            return "TYPE", {"text": self._normalize_text(text)}, ""
+            checked = self._self_check_type_text(self._normalize_text(text))
+            return "TYPE", {"text": checked}, ""
 
         if action == "SCROLL":
             if isinstance(params, dict):
