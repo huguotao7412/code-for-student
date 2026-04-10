@@ -42,9 +42,21 @@ def draw_som_labels(image: Image.Image) -> tuple[Image.Image, dict]:
         ]
 
         draw.rectangle([x, y, x + w, y + h], outline=(255, 255, 0, 150), width=2)
-        label_w, label_h = 25, 20
-        draw.rectangle([x, y, x + label_w, y + label_h], fill=(255, 255, 0, 200))
-        draw.text((x + 5, y + 2), str(idx), fill=(0, 0, 0))
+
+        # 把编号画在按钮中心，避免标签偏到角落
+        label_text = str(idx)
+        try:
+            text_bbox = draw.textbbox((0, 0), label_text)
+            text_w = text_bbox[2] - text_bbox[0]
+            text_h = text_bbox[3] - text_bbox[1]
+        except Exception:
+            text_w, text_h = 12, 12
+        text_x = x + max(0, int(w / 2 - text_w / 2))
+        text_y = y + max(0, int(h / 2 - text_h / 2))
+        bg_pad_x = max(4, int(text_w / 2) + 4)
+        bg_pad_y = max(4, int(text_h / 2) + 4)
+        draw.ellipse([x + w / 2 - bg_pad_x, y + h / 2 - bg_pad_y, x + w / 2 + bg_pad_x, y + h / 2 + bg_pad_y], fill=(255, 255, 0, 220))
+        draw.text((text_x, text_y), label_text, fill=(0, 0, 0))
 
         element_map[idx] = {
             "center": [center_x, center_y],

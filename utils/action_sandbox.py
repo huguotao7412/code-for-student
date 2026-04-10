@@ -43,43 +43,26 @@ def sanitize_and_stick(action: str, params: dict, element_map: dict) -> tuple:
         dy = 0 if y0 <= y <= y1 else min(abs(y - y0), abs(y - y1))
         return (dx * dx + dy * dy) ** 0.5
 
-    if action == "CLICK" and "point" in params:
-        raw_x, raw_y = params["point"]
-        final_x, final_y = clip(raw_x), clip(raw_y)
-
-        best_point = None
-        best_score = None
-        max_project_distance = 260
-
-        for _, meta in element_map.items():
-            center, bbox = extract_meta(meta)
-            if not bbox and center:
-                bbox = [center[0], center[1], center[0], center[1]]
-            if not bbox:
-                continue
-
-            dist = rect_distance([final_x, final_y], bbox)
-            if dist <= max_project_distance:
-                projected = project_into_bbox([final_x, final_y], bbox, pad=8)
-                score = dist
-                if best_score is None or score < best_score:
-                    best_score = score
-                    best_point = projected
-
-        if best_point is not None:
-            final_x, final_y = best_point
-        else:
-            # 保守兜底：若没有任何 bbox 足够接近，再尝试中心吸附
-            for _, meta in element_map.items():
-                center, _ = extract_meta(meta)
-                if not center:
-                    continue
-                dist = ((final_x - center[0]) ** 2 + (final_y - center[1]) ** 2) ** 0.5
-                if dist <= 30:
-                    final_x, final_y = center
-                    break
-
-        params["point"] = [clip(final_x), clip(final_y)]
+    if action == "CLICK" and ("selected_id" in params or "point" in params):
+        selected_id = params.get("selected_id")
+        try:
+            selected_id = int(selected_id)
+        except Exception:
+            pass
+        if selected_id in element_map:
+            center, bbox = extract_meta(element_map[selected_id])
+            if center:
+                params["point"] = [clip(int(center[0])), clip(int(center[1]))]
+            elif bbox:
+                x0, y0, x1, y1 = bbox
+                params["point"] = [clip(int((x0 + x1) / 2)), clip(int((y0 + y1) / 2))]
+            else:
+                params["point"] = [clip(params.get("point", [500, 500])[0]), clip(params.get("point", [500, 500])[1])]
+            params["selected_id"] = selected_id
+        elif "point" in params:
+            # 仅裁剪，不再根据邻近 bbox 自由吸附到其他控件
+            raw_x, raw_y = params["point"]
+            params["point"] = [clip(raw_x), clip(raw_y)]
 
     elif action == "SCROLL":
         if "start_point" in params:
