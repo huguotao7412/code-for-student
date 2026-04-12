@@ -9,7 +9,16 @@ import logging
 import re
 from typing import Any, Dict, Tuple
 
+try:
+    from langgraph.graph import END, START, StateGraph
+except Exception:  # pragma: no cover - fallback for environments without langgraph
+    END = None
+    START = None
+    StateGraph = None
+
 from agent_base import AgentInput, AgentOutput, BaseAgent
+from utils.graph_state import WorkflowState
+from utils.nodes import actor_node, format_output_node, planner_node, reviewer_node
 from utils.parser import robust_parse
 from utils.state import GUIState
 
@@ -20,16 +29,56 @@ class Agent(BaseAgent):
     """LLM 主导，最小 schema 适配。"""
 
     VALID_ACTIONS = {"CLICK", "SCROLL", "TYPE", "OPEN", "COMPLETE"}
+    MAP_CITY_PREFIXES = (
+        "北京", "上海", "广州", "深圳", "杭州", "南京", "苏州", "成都", "重庆", "武汉",
+        "天津", "西安", "长沙", "郑州", "青岛", "厦门", "宁波", "合肥", "福州", "济南",
+        "昆明", "沈阳", "大连", "南昌", "贵阳", "南宁", "石家庄", "太原", "哈尔滨", "长春",
+    )
 
     def _initialize(self):
         self.state = GUIState(max_steps=45)
         self._plan_instruction = ""
         self._task_plan = []
+        self._current_instruction = ""
+        self.graph = self._build_graph()
+
+    def _build_graph(self):
+        if StateGraph is None:
+            logger.warning("langgraph is not available, fallback to legacy single-agent runtime")
+            return None
+        workflow = StateGraph(WorkflowState)
+
+        workflow.add_node("planner", lambda state: planner_node(state, self))
+        workflow.add_node("actor", lambda state: actor_node(state, self))
+        workflow.add_node("reviewer", lambda state: reviewer_node(state, self))
+        workflow.add_node("format_output", lambda state: format_output_node(state, self))
+
+        workflow.add_edge(START, "planner")
+        workflow.add_edge("planner", "actor")
+        workflow.add_edge("actor", "reviewer")
+
+        def _review_route(state: WorkflowState) -> str:
+            if state.get("reviewer_feedback") == "PASS" or int(state.get("retry_count", 0)) >= 2:
+                return "format_output"
+            return "actor"
+
+        workflow.add_conditional_edges(
+            "reviewer",
+            _review_route,
+            {
+                "actor": "actor",
+                "format_output": "format_output",
+            },
+        )
+        workflow.add_edge("format_output", END)
+
+        return workflow.compile()
 
     def reset(self):
         self.state = GUIState(max_steps=45)
         self._plan_instruction = ""
         self._task_plan = []
+        self._current_instruction = ""
 
     @staticmethod
     def _recent_history(history_actions: list, window: int = 2) -> list:
@@ -197,11 +246,27 @@ Few-shot 示例：
             hints.append("- 地图类：起终点输入后常需点候选项确认，确认后再进入下一字段。")
         if "喜马拉雅" in text:
             hints.append("- 喜马拉雅：常见流程是搜索->结果->播放；播放状态可作为完成依据。")
+        if any(k in text for k in ["播放", "听", "收听", "观看"]):
+            hints.append("- 播放类：优先点击可见播放控件（播放键/继续播放按钮），不要把标题文本当作播放入口。")
         return "\n".join(hints) if hints else "- 通用：优先跟随当前页面可见控件证据。"
 
-    def _build_prompt(self, instruction: str, history_actions: list) -> str:
+    def _build_prompt(
+        self,
+        instruction: str,
+        history_actions: list,
+        reviewer_feedback: str = "",
+        retry_count: int = 0,
+    ) -> str:
         self._current_instruction = instruction or ""
         recent = self._recent_history(history_actions, window=2)
+        review_section = ""
+        if reviewer_feedback and reviewer_feedback != "PASS":
+            review_section = f"""
+[Reviewer 反馈]
+- 当前重试次数: {retry_count}
+- 审核意见: {reviewer_feedback}
+- 你必须先修复审核意见，再给下一步动作。
+"""
         return f"""你是 Android GUI 智能代理。每步必须按 ReAct：观察 -> 分析 -> 动作。
 任务目标：【{instruction}】
 
@@ -211,7 +276,7 @@ Few-shot 示例：
 - 步数: {self.state.step_count}/{self.state.max_steps}
 - 当前任务计划(4~8步):
 {self._plan_to_text()}
-
+{review_section}
 [合法动作]
 CLICK / TYPE / SCROLL / OPEN / ENTER / COMPLETE
 
@@ -227,6 +292,12 @@ CLICK / TYPE / SCROLL / OPEN / ENTER / COMPLETE
    - 终点入口上的提示文案不等于已激活输入框；未见终点输入框 caret，不得直接 TYPE 终点词。
    - 若已经在起点/结果页看到地点词，也不能跳过终点入口直接输入。
 4) 输入后确认规则：刚 TYPE 后，下一步优先 ENTER 或点击搜索/确认控件。
+5) 搜索任务强制链路：
+   - 只要任务包含“搜索/查找/检索”，必须先在搜索框 TYPE 任务词，再执行搜索确认（ENTER 或搜索按钮）。
+   - 即便内容区已经出现任务词，也不能跳过 TYPE 去直接点击内容结果。
+6) 播放任务点击规则：
+   - 目标是“播放/收听/观看”时，优先点击播放控件（播放键/继续播放按钮/播放器控制条）。
+   - 标题文本不是默认播放入口，除非界面证据明确显示标题本身可触发播放。
 
 [COMPLETE 触发规则]
 - 仅当目标结果已明确达成时才 COMPLETE，例如：已进入播放态、评论已发布、路线结果已展示。
@@ -294,6 +365,22 @@ COMPLETE:[]
         if not text or not instruction:
             return text
 
+        # 地图/打车任务：剥离地点前缀，保留核心地点词（如“西安回民街”->“回民街”）。
+        if any(k in instruction for k in ["地图", "打车", "导航", "终点", "起点"]):
+            candidate = text
+            for prefix in ["去", "到", "前往", "导航到", "打车到", "目的地", "终点", "起点", "从"]:
+                if candidate.startswith(prefix) and len(candidate) > len(prefix) + 1:
+                    candidate = candidate[len(prefix):].strip()
+            for city in self.MAP_CITY_PREFIXES:
+                if candidate.startswith(city) and len(candidate) > len(city) + 1:
+                    candidate = candidate[len(city):].strip()
+                    break
+            for suffix in ["附近", "周边", "那边", "这里", "那儿"]:
+                if candidate.endswith(suffix) and len(candidate) > len(suffix) + 1:
+                    candidate = candidate[: -len(suffix)].strip()
+            if candidate:
+                text = candidate
+
         # 若指令里存在书名号短语，且当前文本是其子串，优先补全为完整短语。
         for match in re.findall(r"《[^》]+》[^，。！？；,!?;\n]*", instruction):
             phrase = match.strip()
@@ -305,7 +392,7 @@ COMPLETE:[]
             return text
 
         # 仅清理常见扩写尾缀，避免把完整目标词截断成过短片段。
-        noisy_suffixes = ["的视频并查看", "的视频", "并查看"]
+        noisy_suffixes = ["的视频并查看", "的视频", "并查看", "附近", "周边"]
         for suffix in noisy_suffixes:
             if text.endswith(suffix):
                 candidate = text[: -len(suffix)].strip()
@@ -371,13 +458,9 @@ COMPLETE:[]
 
         return action, params, ""
 
-    def act(self, input_data: AgentInput) -> AgentOutput:
-        if self.state.should_force_stop():
-            return AgentOutput(action="COMPLETE", parameters={}, raw_output="Limit reached")
-
+    def _legacy_act(self, input_data: AgentInput) -> AgentOutput:
         current_signature = self._image_signature(input_data.current_image)
 
-        # 首步执行前先做任务规划；若指令变化则重新规划。
         if input_data.step_count <= 1 or self._plan_instruction != input_data.instruction:
             self._ensure_task_plan(input_data.instruction, input_data.current_image)
 
@@ -404,7 +487,6 @@ COMPLETE:[]
 
         action, params, expected_effect = self._normalize_output(model_action, model_params)
 
-        # 轻量刹车：刚 TYPE 后若仍输出 TYPE，改为确认点击，避免重复输入。
         last_action = ""
         if input_data.history_actions:
             last = input_data.history_actions[-1]
@@ -426,3 +508,50 @@ COMPLETE:[]
         self.state.last_image = input_data.current_image.copy()
 
         return AgentOutput(action=action, parameters=params, raw_output=raw_output, usage=usage)
+
+    def act(self, input_data: AgentInput) -> AgentOutput:
+        if self.state.should_force_stop():
+            return AgentOutput(action="COMPLETE", parameters={}, raw_output="Limit reached")
+
+        if not self.graph:
+            return self._legacy_act(input_data)
+
+        current_signature = self._image_signature(input_data.current_image)
+        initial_state: WorkflowState = {
+            "input_data": input_data,
+            "plan_instruction": self._plan_instruction,
+            "task_plan": self._task_plan,
+            "history_actions": input_data.history_actions,
+            "proposed_action": "",
+            "proposed_params": {},
+            "model_effect": "",
+            "reviewer_feedback": "",
+            "retry_count": 0,
+            "raw_output": "",
+            "usage": None,
+        }
+
+        try:
+            final_state = self.graph.invoke(initial_state)
+            output = final_state.get("final_output")
+            if not isinstance(output, AgentOutput):
+                output = AgentOutput(
+                    action=final_state.get("normalized_action", "CLICK"),
+                    parameters=final_state.get("normalized_params", {"point": [500, 500]}),
+                    raw_output=final_state.get("raw_output", ""),
+                    usage=final_state.get("usage"),
+                )
+            expected_effect = final_state.get("expected_effect", "画面发生变化")
+        except Exception as e:
+            logger.warning(f"Graph invoke failed, fallback to legacy: {e}")
+            return self._legacy_act(input_data)
+
+        self.state.update(
+            f"{output.action}:{output.parameters}",
+            expected_effect or "画面发生变化",
+            visual_hash=current_signature,
+        )
+        self.state.last_image = input_data.current_image.copy()
+
+        return output
+
