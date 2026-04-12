@@ -99,71 +99,45 @@ class Agent(BaseAgent):
 1) 仅输出 JSON，不要解释。
 2) JSON 格式：
 {{
-  "sub_steps": [
-    {{"id": 1, "stage": "阶段名", "goal": "要完成什么", "action_hint": "OPEN/CLICK/TYPE/SCROLL/COMPLETE"}}
+  \"sub_steps\": [
+    {{\"id\": 1, \"stage\": \"阶段名\", \"goal\": \"要完成什么\", \"action_hint\": \"OPEN/CLICK/TYPE/SCROLL/COMPLETE\"}}
   ]
 }}
-3) 计划要可迁移，不依赖固定坐标。
+3) 计划要可迁移，不依赖固定坐标、固定 App 或固定页面模板。
+4) 优先使用任务意图驱动（例如：搜索、输入确认、结果选择、发布、播放、地图起终点）。
 
-Few-shot 示例：
-[示例1]
-任务：去喜马拉雅搜索《三体》多人有声剧并播放
-{{"sub_steps":[
-{{"id":1,"stage":"打开应用","goal":"进入喜马拉雅","action_hint":"OPEN"}},
-{{"id":2,"stage":"处理遮挡","goal":"关闭弹窗或引导层","action_hint":"CLICK"}},
-{{"id":3,"stage":"进入搜索","goal":"点击搜索框或搜索入口","action_hint":"CLICK"}},
-{{"id":4,"stage":"输入关键词","goal":"输入《三体》多人有声剧","action_hint":"TYPE"}},
-{{"id":5,"stage":"确认搜索","goal":"执行搜索","action_hint":"CLICK"}},
-{{"id":6,"stage":"选择结果","goal":"进入目标音频","action_hint":"CLICK"}},
-{{"id":7,"stage":"播放","goal":"点击播放控件","action_hint":"CLICK"}},
-{{"id":8,"stage":"结束","goal":"任务完成","action_hint":"COMPLETE"}}
+通用示例：
+[示例1：搜索并查看]
+任务：在某内容应用中搜索关键词并打开一个结果
+{{\"sub_steps\":[
+{{\"id\":1,\"stage\":\"进入任务场景\",\"goal\":\"进入目标应用或目标页面\",\"action_hint\":\"OPEN\"}},
+{{\"id\":2,\"stage\":\"处理遮挡\",\"goal\":\"关闭弹窗/权限引导\",\"action_hint\":\"CLICK\"}},
+{{\"id\":3,\"stage\":\"进入搜索\",\"goal\":\"点击搜索入口并激活输入框\",\"action_hint\":\"CLICK\"}},
+{{\"id\":4,\"stage\":\"输入关键词\",\"goal\":\"输入任务关键词\",\"action_hint\":\"TYPE\"}},
+{{\"id\":5,\"stage\":\"确认搜索\",\"goal\":\"执行搜索确认\",\"action_hint\":\"CLICK\"}},
+{{\"id\":6,\"stage\":\"选择结果\",\"goal\":\"进入目标内容\",\"action_hint\":\"CLICK\"}},
+{{\"id\":7,\"stage\":\"结束\",\"goal\":\"任务完成\",\"action_hint\":\"COMPLETE\"}}
 ]}}
 
-[示例2]
-任务：去爱奇艺搜索电视剧并发表评论
-{{"sub_steps":[
-{{"id":1,"stage":"打开应用","goal":"进入爱奇艺","action_hint":"OPEN"}},
-{{"id":2,"stage":"处理遮挡","goal":"关闭弹窗","action_hint":"CLICK"}},
-{{"id":3,"stage":"进入搜索","goal":"点击搜索入口","action_hint":"CLICK"}},
-{{"id":4,"stage":"进入剧集","goal":"搜索并进入目标剧集页面","action_hint":"CLICK"}},
-{{"id":5,"stage":"进入评论","goal":"打开评论区","action_hint":"CLICK"}},
-{{"id":6,"stage":"发布评论","goal":"输入并发送评论","action_hint":"TYPE"}},
-{{"id":7,"stage":"结束","goal":"任务完成","action_hint":"COMPLETE"}}
+[示例2：地图起终点]
+任务：在地图应用中输入起点和终点并进入路线/打车结果
+{{\"sub_steps\":[
+{{\"id\":1,\"stage\":\"进入功能入口\",\"goal\":\"进入路线或打车功能\",\"action_hint\":\"CLICK\"}},
+{{\"id\":2,\"stage\":\"输入起点\",\"goal\":\"输入并选择起点候选项\",\"action_hint\":\"TYPE\"}},
+{{\"id\":3,\"stage\":\"确认起点\",\"goal\":\"点击候选项确认起点\",\"action_hint\":\"CLICK\"}},
+{{\"id\":4,\"stage\":\"进入终点输入\",\"goal\":\"切换到终点输入入口\",\"action_hint\":\"CLICK\"}},
+{{\"id\":5,\"stage\":\"输入终点\",\"goal\":\"输入并选择终点候选项\",\"action_hint\":\"TYPE\"}},
+{{\"id\":6,\"stage\":\"结束\",\"goal\":\"路线/打车结果达成\",\"action_hint\":\"COMPLETE\"}}
 ]}}
 
-[示例3]
-任务：去哔哩哔哩搜索视频并查看
-{{"sub_steps":[
-{{"id":1,"stage":"打开应用","goal":"进入哔哩哔哩","action_hint":"OPEN"}},
-{{"id":2,"stage":"进入搜索","goal":"点击搜索框","action_hint":"CLICK"}},
-{{"id":3,"stage":"输入关键词","goal":"输入目标关键词","action_hint":"TYPE"}},
-{{"id":4,"stage":"确认搜索","goal":"点击搜索按钮","action_hint":"CLICK"}},
-{{"id":5,"stage":"选择结果","goal":"进入目标视频","action_hint":"CLICK"}},
-{{"id":6,"stage":"结束","goal":"任务完成","action_hint":"COMPLETE"}}
-]}}
-
-[示例4]
-任务：去抖音我的喜欢里搜索跳舞的视频并查看
-{{"sub_steps":[
-{{"id":1,"stage":"进入个人页","goal":"切换到个人页","action_hint":"CLICK"}},
-{{"id":2,"stage":"进入喜欢Tab","goal":"点击喜欢标签","action_hint":"CLICK"}},
-{{"id":3,"stage":"进入搜索","goal":"点击搜索图标","action_hint":"CLICK"}},
-{{"id":4,"stage":"输入关键词","goal":"输入跳舞","action_hint":"TYPE"}},
-{{"id":5,"stage":"确认搜索","goal":"执行搜索","action_hint":"CLICK"}},
-{{"id":6,"stage":"查看结果","goal":"点击一个结果视频查看","action_hint":"CLICK"}},
-{{"id":7,"stage":"结束","goal":"任务完成","action_hint":"COMPLETE"}}
-]}}
-
-[示例5]
-任务：去百度地图打车，从A到B
-{{"sub_steps":[
-{{"id":1,"stage":"打开应用","goal":"进入百度地图","action_hint":"OPEN"}},
-{{"id":2,"stage":"进入打车","goal":"点击打车入口","action_hint":"CLICK"}},
-{{"id":3,"stage":"输入起点","goal":"输入并选择起点","action_hint":"TYPE"}},
-{{"id":4,"stage":"确认起点","goal":"从候选项选择起点","action_hint":"CLICK"}},
-{{"id":5,"stage":"输入终点","goal":"输入并选择终点","action_hint":"TYPE"}},
-{{"id":6,"stage":"确认终点","goal":"从候选项选择终点","action_hint":"CLICK"}},
-{{"id":7,"stage":"结束","goal":"任务完成","action_hint":"COMPLETE"}}
+[示例3：发布型任务]
+任务：在内容页面发布评论/消息
+{{\"sub_steps\":[
+{{\"id\":1,\"stage\":\"定位入口\",\"goal\":\"进入目标内容页并找到评论/输入入口\",\"action_hint\":\"CLICK\"}},
+{{\"id\":2,\"stage\":\"激活输入\",\"goal\":\"点击输入框使其可输入\",\"action_hint\":\"CLICK\"}},
+{{\"id\":3,\"stage\":\"输入内容\",\"goal\":\"输入评论或消息文本\",\"action_hint\":\"TYPE\"}},
+{{\"id\":4,\"stage\":\"提交\",\"goal\":\"点击发送/发布\",\"action_hint\":\"CLICK\"}},
+{{\"id\":5,\"stage\":\"结束\",\"goal\":\"确认已发布\",\"action_hint\":\"COMPLETE\"}}
 ]}}
 
 现在请只针对下面任务生成计划：
@@ -234,21 +208,20 @@ Few-shot 示例：
             self._task_plan = self._parse_plan("")
 
     def _app_specific_hints(self, instruction: str) -> str:
+        """兼容原调用名：实际返回基于任务意图的通用提示，避免绑定具体 App。"""
         text = instruction or ""
-        hints = []
-        if "抖音" in text:
-            hints.append("- 抖音：个人页/喜欢页常有放大镜搜索入口；优先点搜索控件，不因“喜欢”文案误点内容区。")
-        if "哔哩" in text or "b站" in text.lower() or "bilibili" in text.lower():
-            hints.append("- 哔哩哔哩：搜索通常是顶部输入框+确认按钮；输入后优先确认再选视频。")
-        if "爱奇艺" in text:
-            hints.append("- 爱奇艺：常先处理弹窗，再走搜索/剧集/评论链路。")
-        if "百度地图" in text or "地图" in text:
-            hints.append("- 地图类：起终点输入后常需点候选项确认，确认后再进入下一字段。")
-        if "喜马拉雅" in text:
-            hints.append("- 喜马拉雅：常见流程是搜索->结果->播放；播放状态可作为完成依据。")
-        if any(k in text for k in ["播放", "听", "收听", "观看"]):
-            hints.append("- 播放类：优先点击可见播放控件（播放键/继续播放按钮），不要把标题文本当作播放入口。")
-        return "\n".join(hints) if hints else "- 通用：优先跟随当前页面可见控件证据。"
+        hints = ["- 通用：所有判断以当前截图可见控件证据为准，不依赖固定坐标。"]
+
+        if any(k in text for k in ["搜索", "查找", "检索", "搜"]):
+            hints.append("- 搜索类：先确认输入框已激活（可见 caret）再 TYPE；TYPE 后优先 ENTER 或点击搜索确认控件。")
+        if any(k in text for k in ["播放", "收听", "听", "观看"]):
+            hints.append("- 播放类：优先点击播放器控件（播放键/控制条），不要默认把标题文本当作播放入口。")
+        if any(k in text for k in ["地图", "导航", "打车", "路线", "起点", "终点"]):
+            hints.append("- 地图类：起点确认后先进入终点输入入口，再输入终点；输入后优先选择候选项确认。")
+        if any(k in text for k in ["评论", "发布", "发送", "提交"]):
+            hints.append("- 发布类：先激活输入框再 TYPE，随后执行发送/发布并等待成功态。")
+
+        return "\n".join(hints)
 
     def _build_prompt(
         self,
@@ -303,7 +276,7 @@ CLICK / TYPE / SCROLL / OPEN / ENTER / COMPLETE
 - 仅当目标结果已明确达成时才 COMPLETE，例如：已进入播放态、评论已发布、路线结果已展示。
 - 若还有关键后续动作（如确认搜索、选择结果、提交），不得提前 COMPLETE。
 
-[测试集常见失分（分类经验，不是硬编码）]
+[常见失误模式]
 1) 动作类型错：应 TYPE/ENTER 却 CLICK，或应 CLICK 却 TYPE。
 2) 阶段判断错：输入后没有进入“确认搜索”阶段，继续重复输入或乱点内容区。
 3) 语义对齐错：把“文本相关词”当成“可点击入口”。
@@ -316,7 +289,7 @@ CLICK / TYPE / SCROLL / OPEN / ENTER / COMPLETE
   - 错误：回民街附近 -> 正确：回民街
   - 错误：去回民街 -> 正确：回民街
 
-[App 专属知识]
+[任务模式提示]
 {self._app_specific_hints(instruction)}
 
 [反过拟合要求]

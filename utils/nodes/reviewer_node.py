@@ -61,7 +61,7 @@ def reviewer_node(state: WorkflowState, agent: Any) -> Dict[str, Any]:
         }
 
     # Rule 2: map flow usually needs entering destination field before another TYPE.
-    if ("地图" in instruction or "百度地图" in instruction) and last_action == "TYPE" and action == "TYPE":
+    if "地图" in instruction and last_action == "TYPE" and action == "TYPE":
         return {
             "reviewer_feedback": "REJECT: 地图双输入约束触发。请先点击终点输入入口，再输入终点。",
             "retry_count": retry_count + 1,
