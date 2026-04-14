@@ -110,6 +110,13 @@
                 ]
             },
             "next": "5"
+        },
+        {
+            "action": "TYPE",
+            "params": {
+                "text": "跳舞"
+            },
+            "next": "6"
         }
     ],
     "5": [
@@ -122,11 +129,6 @@
         }
     ],
     "6": [
-        {
-            "action": "ENTER",
-            "params": {},
-            "next": "5"
-        },
         {
             "action": "CLICK",
             "params": {

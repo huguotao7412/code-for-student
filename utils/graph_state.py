@@ -9,6 +9,11 @@ class WorkflowState(TypedDict, total=False):
     task_plan: List[Dict[str, Any]]
     history_actions: List[Dict[str, Any]]
 
+    # Task profiling for rule-based stage guards.
+    task_type: str
+    task_slots: Dict[str, str]
+    flow_flags: Dict[str, Any]
+
     proposed_action: str
     proposed_params: Dict[str, Any]
     model_effect: str

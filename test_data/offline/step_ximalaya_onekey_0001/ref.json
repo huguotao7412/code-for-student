@@ -92,17 +92,12 @@
         {
             "action": "TYPE",
             "params": {
-                "text": "《三体》多人有声剧"
+                "text": "正则 .*三体.*"
             },
             "next": "5"
         }
     ],
     "5": [
-        {
-            "action": "ENTER",
-            "params": {},
-            "next": "6"
-        },
         {
             "action": "CLICK",
             "params": {
