@@ -16,7 +16,8 @@ except Exception:  # pragma: no cover - fallback for environments without langgr
     START = None
     StateGraph = None
 
-from agent_base import AgentInput, AgentOutput, BaseAgent
+from agent_base import AgentInput, AgentOutput, BaseAgent, ConfigTamperError, FORBIDDEN_KWARGS
+from utils.a2a_protocol import A2AChannels, read_payload
 from utils.graph_state import WorkflowState
 from utils.nodes import actor_node, format_output_node, planner_node, reviewer_node
 from utils.parser import robust_parse
@@ -46,6 +47,45 @@ class Agent(BaseAgent):
         "美团外卖": "美团",
         "去哪旅行": "去哪儿旅行",
     }
+    PROMPT_CORE_RULES = [
+        "- 所有判断以当前截图可见控件为准，不依赖固定坐标或固定模板。",
+        "- 若有弹窗/广告/权限遮挡，优先处理遮挡。",
+        "- TYPE 文本优先使用任务原文关键词，禁止同义改写。",
+        "- 若刚执行 TYPE，下一步优先 ENTER 或点击搜索/确认控件。",
+        "- 只在目标状态明确达成时才输出 COMPLETE。",
+    ]
+    PROMPT_STRATEGIES = {
+        "search": [
+            "- 搜索链路必须是：激活搜索框 -> TYPE 任务词 -> 搜索确认。",
+            "- 内容区出现同名词时，也不能跳过 TYPE 直接点内容。",
+            "- 搜索入口可为文字按钮、放大镜图标或斜放的搜索图标。",
+        ],
+        "map": [
+            "- 地图双输入链路：起点确认后，先进入终点输入入口，再 TYPE 终点。",
+            "- 终点入口提示文案不等于可输入框；未激活输入框前不得直接 TYPE。",
+            "- 地点词可在证据充分时去城市前缀；如回民街可用正则形式。",
+        ],
+        "video": [
+            "- 播放第N集任务：先进入播放态，再选集。",
+            "- 评论区/讨论区任务：先进入播放态，再进入评论/讨论区域。",
+        ],
+        "publish": [
+            "- 发布类任务：先激活输入框，再 TYPE，再点击发送/发布。",
+        ],
+        "date": [
+            "- 日期任务先识别界面上今天对应日期，再顺推明天/后天。",
+        ],
+        "voice": [
+            "- 更换语音包任务先确认目标词条可见，再点击对应词条。",
+        ],
+        "dedupe": [
+            "- 若任务是去喜欢里搜索且当前已在喜欢页，不要重复点击喜欢入口。",
+        ],
+        "app_alias": [
+            "- 任务提到美团外卖时，OPEN 应用名使用 美团。",
+            "- 任务提到去哪旅行时，OPEN 应用名使用 去哪儿旅行。",
+        ],
+    }
 
     def _initialize(self):
         self.state = GUIState(max_steps=45)
@@ -70,7 +110,10 @@ class Agent(BaseAgent):
         workflow.add_edge("actor", "reviewer")
 
         def _review_route(state: WorkflowState) -> str:
-            if state.get("reviewer_feedback") == "PASS" or int(state.get("retry_count", 0)) >= self.REVIEW_MAX_RETRY:
+            review_payload = read_payload(state, A2AChannels.REVIEW, default={}) or {}
+            verdict = str(review_payload.get("verdict", "")).upper()
+            retry_count = int(review_payload.get("retry_count", state.get("retry_count", 0)))
+            if verdict == "PASS" or state.get("reviewer_feedback") == "PASS" or retry_count > self.REVIEW_MAX_RETRY:
                 return "format_output"
             return "actor"
 
@@ -227,28 +270,30 @@ class Agent(BaseAgent):
             logger.warning(f"Plan generation failed: {e}")
             self._task_plan = self._parse_plan("")
 
-    def _app_specific_hints(self, instruction: str) -> str:
-        """兼容原调用名：实际返回基于任务意图的通用提示，避免绑定具体 App。"""
+    def _app_specific_hints(self, instruction: str, task_type: str = "general", flow_flags: Dict[str, Any] | None = None) -> str:
+        """将关键策略模块化，减少散落硬编码。"""
         text = instruction or ""
-        hints = ["- 通用：所有判断以当前截图可见控件证据为准，不依赖固定坐标。"]
+        flags = flow_flags or {}
+        hints = list(self.PROMPT_CORE_RULES)
 
-        if any(k in text for k in ["搜索", "查找", "检索", "搜"]):
-            hints.append("- 搜索类：必须走‘激活搜索框 -> TYPE任务词 -> 搜索确认’；不要点击内容区同名词替代 TYPE。")
-            hints.append("- 搜索入口可为文字按钮、标准放大镜或斜放🔍/🔎。")
-        if any(k in text for k in ["播放", "收听", "听", "观看"]):
-            hints.append("- 播放类：优先点击播放器控件（播放键/控制条），不要默认把标题文本当作播放入口。")
-        if any(k in text for k in ["地图", "导航", "打车", "路线", "起点", "终点"]):
-            hints.append("- 地图类：起点确认后先进入终点输入入口，再输入终点；输入后优先选择候选项确认。")
+        if task_type in {"search", "food", "flight", "map"} or any(k in text for k in ["搜索", "查找", "检索", "搜"]):
+            hints.extend(self.PROMPT_STRATEGIES["search"])
+        if task_type == "map" or any(k in text for k in ["地图", "导航", "打车", "路线", "起点", "终点"]):
+            hints.extend(self.PROMPT_STRATEGIES["map"])
+        if task_type == "video" or any(k in text for k in ["播放", "收听", "听", "观看"]):
+            hints.extend(self.PROMPT_STRATEGIES["video"])
         if any(k in text for k in ["评论", "发布", "发送", "提交"]):
-            hints.append("- 发布类：先激活输入框再 TYPE，随后执行发送/发布并等待成功态。")
-        if "喜欢" in text:
-            hints.append("- 喜欢页：若当前已在‘喜欢/我的喜欢’页，不要再次点击任何‘喜欢’入口，直接执行搜索链路。")
-        if "美团外卖" in text:
-            hints.append("- 应用名：先 OPEN ‘美团’，再进入‘外卖’入口。")
-        if "去哪旅行" in text:
-            hints.append("- 应用名：OPEN 目标应为‘去哪儿旅行’。")
+            hints.extend(self.PROMPT_STRATEGIES["publish"])
         if any(k in text for k in ["今天", "明天", "后天", "日期", "出发", "入住"]):
-            hints.append("- 日期类：若界面有‘今天’标签或已显示具体日历日期，先定位今天，再顺推明天/后天。")
+            hints.extend(self.PROMPT_STRATEGIES["date"])
+        if any(k in text for k in ["语音包", "导航语音", "语音", "更换语音"]):
+            hints.extend(self.PROMPT_STRATEGIES["voice"])
+        if "喜欢" in text:
+            hints.extend(self.PROMPT_STRATEGIES["dedupe"])
+        if "美团外卖" in text or "去哪旅行" in text:
+            hints.extend(self.PROMPT_STRATEGIES["app_alias"])
+        if flags.get("search_reactivate_needed"):
+            hints.append("- 你很可能已进入新搜索页：先重新激活搜索框，再 TYPE。")
 
         return "\n".join(hints)
 
@@ -259,18 +304,25 @@ class Agent(BaseAgent):
         reviewer_feedback: str = "",
         retry_count: int = 0,
     ) -> str:
+        stuck_warning = ""
+        if self.state.stuck_level >= 2:
+            stuck_warning = "\n[系统警告] 你似乎陷入了死循环，请立即改变策略（如先处理遮挡、换入口、或执行一次有效滚动）。"
         self._current_instruction = instruction or ""
         recent = self._recent_history(history_actions, window=2)
         task_type, task_slots, flow_flags = self._build_task_profile(instruction, history_actions)
+
         review_section = ""
         if reviewer_feedback and reviewer_feedback != "PASS":
             review_section = f"""
 [Reviewer 反馈]
 - 当前重试次数: {retry_count}
 - 审核意见: {reviewer_feedback}
-- 你必须先修复审核意见，再给下一步动作。
+- 必须先修复该问题，再给下一步动作。
 """
-        return f"""你是 Android GUI 智能代理。每步必须按 ReAct：观察 -> 分析 -> 动作。
+
+        policy = self._app_specific_hints(instruction, task_type=task_type, flow_flags=flow_flags)
+
+        return f"""你是 Android GUI 智能代理。每一步按 ReAct 输出：观察 -> 分析 -> 动作。
 任务目标：【{instruction}】
 
 [当前状态]
@@ -280,64 +332,24 @@ class Agent(BaseAgent):
 - 当前任务计划(4~8步):
 {self._plan_to_text()}
 {review_section}
+{stuck_warning}
+
 [合法动作]
 CLICK / TYPE / SCROLL / OPEN / ENTER / COMPLETE
 
-[最高优先级规则]
-1) 弹窗/广告/权限遮挡最高优先级：若存在遮挡，先处理遮挡再做其他动作。
-2) 搜索框重定位规则：首次点击搜索入口后，可能进入新搜索页且搜索框位置变化；此时必须重新识别并二次激活搜索框，再 TYPE。
-3) 搜索确认择优规则：若出现多个搜索确认键，优先点击离搜索框最近的确认键。
-4) 地图双输入框规则：
-   - 起点确认后，必须先进入终点输入入口（常见文案“你要去哪儿”/“终点”/终点占位条）再 TYPE 终点。
-   - 终点入口上的提示文案不等于已激活输入框；未见终点输入框 caret，不得直接 TYPE 终点词。
-   - 地点输入优先去城市前缀示例：'西安回民街' 优先输入 '回民街'（可用 '.*回民街' 形式）。
-5) 输入后确认规则：刚 TYPE 后，下一步优先 ENTER 或点击搜索/确认控件。
-6) 搜索任务强制链路：
-   - 只要任务包含“搜索/查找/检索”，必须先在搜索框 TYPE 任务词，再执行搜索确认（ENTER 或搜索按钮）。
-   - 即便内容区已经出现任务词，也不能跳过 TYPE 去直接点击内容结果。
-   - 禁止点击内容区域的任务词来代替搜索流程。
-7) 页面去重规则：
-   - 任务是“去喜欢里面搜索...”且当前已在喜欢页时，不要再点击任何“喜欢”按钮，直接执行搜索链路。
-8) 应用名规则：
-   - 任务出现“美团外卖”时，OPEN 目标应用应为“美团”，进入后再找“外卖”入口。
-   - 任务出现“去哪旅行”时，OPEN 目标应用应为“去哪儿旅行”。
-9) 视频规则：
-   - 当任务包含“播放第N集”时，顺序必须是“先进入播放态（点击播放键）-> 再选集”，禁止先点第N集再播放。
-   - 当任务包含“评论区/讨论区”时，必须先进入播放态，再进入评论区/讨论区。
-10) 语音包规则：
-   - 更换语音包类任务，先确认界面可见目标词控件，再点击对应词条。
-11) 同名控件择优：
-   - 若界面中出现两个相同目标词控件，优先选择更靠近屏幕中心的控件。
-12) 日期理解规则：
-   - 涉及今天/明天/后天时，先观察界面是否已经展示日期（如某日标注“今天”）。
-   - 若“今天”已定位，再顺推 1 天=明天，2 天=后天，选择对应日期。
+[关键策略]
+{policy}
 
-[COMPLETE 触发规则]
-- 仅当目标结果已明确达成时才 COMPLETE，例如：已进入播放态、评论已发布、路线结果已展示。
-- 若还有关键后续动作（如确认搜索、选择结果、提交），不得提前 COMPLETE。
-
-[常见失误模式]
-1) 动作类型错：应 TYPE/ENTER 却 CLICK，或应 CLICK 却 TYPE。
-2) 阶段判断错：输入后没有进入“确认搜索”阶段，继续重复输入或乱点内容区。
-3) 语义对齐错：把“文本相关词”当成“可点击入口”。
-
-[文本输入规则（严格评分）]
-- TYPE 文本优先使用任务里的原文关键词，禁止同义改写、禁止无证据裁剪。
-- 若任务计划里的 TYPE 步骤提供 input_text，优先按该原文关键词输入。
-- 仅在“裁剪后文本也完整出现在任务原文”时，才允许做轻量去前后缀。
-
-[任务模式提示]
+[任务画像]
 - task_type={task_type}
 - task_slots={task_slots}
 - flow_flags={flow_flags}
-{self._app_specific_hints(instruction)}
 
-[反过拟合要求]
-- 可以借鉴失败模式，但不要把本地样例当圣经。
-- 禁止依赖固定坐标、固定页面模板、固定步骤记忆；必须以当前截图可见证据为准。
+[坐标系统]
+当前屏幕坐标为归一化 1000x1000：左上 [0,0]，右下 [1000,1000]。
+CLICK 和 SCROLL 的坐标必须在 0~1000。
 
 [输出格式]
-必须严格按以下结构输出：
 [Observe] 只描述当前屏幕可见事实
 [Analyze] 判断当前阶段与下一步意图
 [Action] 仅一条动作，格式如下之一：
@@ -347,7 +359,7 @@ SCROLL:[[x1,y1],[x2,y2]]
 OPEN:['应用名']
 ENTER:[]
 COMPLETE:[]
-[Expected Effect] 简述执行后应看到的变化
+[Expected Effect] 执行后应看到的变化
 """
 
     @staticmethod
@@ -363,7 +375,7 @@ COMPLETE:[]
     def _clip_norm_point(point: list) -> list:
         if not point or len(point) != 2:
             return [500, 500]
-        return [max(10, min(990, int(point[0]))), max(10, min(990, int(point[1])))]
+        return [max(0, min(1000, int(point[0]))), max(0, min(1000, int(point[1])))]
 
     @staticmethod
     def _normalize_text(text: Any) -> str:
@@ -538,7 +550,6 @@ COMPLETE:[]
                 return "CLICK", {"point": self._clip_norm_point(params["point"])}, "确认输入并继续"
             if isinstance(params, dict) and "x" in params and "y" in params:
                 return "CLICK", {"point": self._clip_norm_point([params["x"], params["y"]])}, "确认输入并继续"
-            # 严格评测中 ENTER 常对应右上角确认/搜索按钮，避免中心兜底误点。
             return "CLICK", {"point": [900, 80]}, "确认输入并继续"
 
         if action == "CLICK":
@@ -575,7 +586,11 @@ COMPLETE:[]
                 app_name = params.get("app_name", params.get("app", params.get("content", "")))
             normalized_name = self._normalize_text(app_name)
             normalized_name = self.APP_ALIASES.get(normalized_name, normalized_name)
-            return "OPEN", {"app_name": normalized_name}, ""
+            if not normalized_name:
+                normalized_name = self._infer_open_app_name(getattr(self, "_current_instruction", "") or "")
+            if normalized_name:
+                return "OPEN", {"app_name": normalized_name}, ""
+            return "CLICK", {"point": [500, 500]}, "OPEN 缺少 app_name，退化为安全点击"
 
         if action == "COMPLETE":
             return "COMPLETE", {}, ""
@@ -592,6 +607,7 @@ COMPLETE:[]
             "plan_instruction": self._plan_instruction,
             "task_plan": self._task_plan,
             "history_actions": input_data.history_actions,
+            "mailbox": {},
             "task_type": task_type,
             "task_slots": task_slots,
             "flow_flags": flow_flags,
@@ -613,7 +629,10 @@ COMPLETE:[]
 
         while True:
             state.update(reviewer_node(workflow_state, self))
-            if state.get("reviewer_feedback") == "PASS" or int(state.get("retry_count", 0)) >= self.REVIEW_MAX_RETRY:
+            review_payload = read_payload(state, A2AChannels.REVIEW, default={}) or {}
+            verdict = str(review_payload.get("verdict", "")).upper()
+            retry_count = int(review_payload.get("retry_count", state.get("retry_count", 0)))
+            if verdict == "PASS" or state.get("reviewer_feedback") == "PASS" or retry_count > self.REVIEW_MAX_RETRY:
                 break
             state.update(actor_node(workflow_state, self))
 
@@ -630,6 +649,13 @@ COMPLETE:[]
 
     def _finalize_output(self, final_state: WorkflowState) -> tuple[AgentOutput, str]:
         output = final_state.get("final_output")
+        expected_effect = final_state.get("expected_effect", "画面发生变化")
+
+        if not isinstance(output, AgentOutput):
+            final_payload = read_payload(final_state, A2AChannels.FINAL_OUTPUT, default={}) or {}
+            output = final_payload.get("final_output")
+            expected_effect = final_payload.get("expected_effect", expected_effect)
+
         if not isinstance(output, AgentOutput):
             output = AgentOutput(
                 action=final_state.get("normalized_action", "CLICK"),
@@ -637,7 +663,6 @@ COMPLETE:[]
                 raw_output=final_state.get("raw_output", ""),
                 usage=final_state.get("usage"),
             )
-        expected_effect = final_state.get("expected_effect", "画面发生变化")
         return output, expected_effect
 
     def act(self, input_data: AgentInput) -> AgentOutput:
@@ -664,3 +689,61 @@ COMPLETE:[]
 
         return output
 
+    def _call_api(self, messages, **kwargs):
+        """Agent-local API wrapper: keep base safety checks but honor runtime kwargs."""
+        forbidden_found = []
+        safe_kwargs = {}
+        for key, value in kwargs.items():
+            if key.lower() in FORBIDDEN_KWARGS or key in FORBIDDEN_KWARGS:
+                forbidden_found.append(key)
+            else:
+                safe_kwargs[key] = value
+
+        if forbidden_found:
+            logger.warning(
+                f"[安全警告] 以下敏感参数已被移除: {forbidden_found}。"
+                "请勿尝试传入 base_url、api_key、model 等参数。"
+            )
+
+        current_signature = self._compute_runtime_signature()
+        if current_signature != self._config_signature:
+            raise ConfigTamperError(
+                "检测到配置篡改！运行时签名与初始化签名不一致。\n"
+                f"初始签名: {self._config_signature}\n"
+                f"当前签名: {current_signature}\n"
+                "评测已终止。"
+            )
+
+        try:
+            from openai import OpenAI
+        except ImportError:
+            raise ImportError("请安装 openai 包: pip install openai")
+
+        client = OpenAI(base_url=self._api_url, api_key=self._api_key)
+        logger.info(f"[API调用] model={self._model_id}, url={self._api_url}")
+
+        user_extra_body = safe_kwargs.pop("extra_body", None)
+        extra_body = {"thinking": {"type": "disabled"}}
+        if isinstance(user_extra_body, dict):
+            extra_body.update(user_extra_body)
+
+        return client.chat.completions.create(
+            model=self._model_id,
+            messages=messages,
+            extra_body=extra_body,
+            **safe_kwargs,
+        )
+
+    def _infer_open_app_name(self, instruction: str) -> str:
+        text = instruction or ""
+        for src, target in self.APP_ALIASES.items():
+            if src in text:
+                return target
+
+        candidates = [
+            "百度地图", "美团", "去哪儿旅行", "腾讯视频", "爱奇艺", "哔哩哔哩", "抖音", "快手", "芒果TV", "喜马拉雅",
+        ]
+        for app in candidates:
+            if app in text:
+                return app
+        return ""

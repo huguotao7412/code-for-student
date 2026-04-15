@@ -1,6 +1,7 @@
 from typing import Any, Dict, List, Optional, TypedDict
 
 from agent_base import AgentInput, AgentOutput, UsageInfo
+from utils.a2a_protocol import A2AMessage
 
 
 class WorkflowState(TypedDict, total=False):
@@ -8,6 +9,7 @@ class WorkflowState(TypedDict, total=False):
     plan_instruction: str
     task_plan: List[Dict[str, Any]]
     history_actions: List[Dict[str, Any]]
+    mailbox: Dict[str, A2AMessage]
 
     # Task profiling for rule-based stage guards.
     task_type: str
