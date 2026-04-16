@@ -61,11 +61,15 @@ def robust_parse(raw_text: str) -> Tuple[str, Dict[str, Any]]:
 
     # 5) CLICK / CLICK_ID
     if "CLICK_ID" in upper:
-        id_match = re.search(r"CLICK_ID\s*[:=]\s*\[?\s*(\d+)\s*]?\s*$", action_block.strip(), re.IGNORECASE)
+        id_match = re.search(r"CLICK_ID\s*[:=]\s*\[?\s*(\d+)\s*]?", action_block, re.IGNORECASE)
         if id_match:
             return "CLICK_ID", {"id": int(id_match.group(1))}
 
     if "CLICK" in upper:
+        id_match = re.search(r"CLICK\s*[:=]\s*\[?\s*(\d+)\s*]?", action_block, re.IGNORECASE)
+        if id_match and "CLICK_ID" not in upper:
+            return "CLICK_ID", {"id": int(id_match.group(1))}
+
         xy_match = re.search(r"(?:x\s*[:=]\s*(-?\d+)).*?(?:y\s*[:=]\s*(-?\d+))", action_block, re.IGNORECASE)
         if xy_match:
             return "CLICK", {"point": [int(xy_match.group(1)), int(xy_match.group(2))]}
@@ -77,11 +81,6 @@ def robust_parse(raw_text: str) -> Tuple[str, Dict[str, Any]]:
         click_nums = re.findall(r"-?\d+", action_block)
         if len(click_nums) >= 2:
             return "CLICK", {"point": [int(click_nums[0]), int(click_nums[1])]}
-
-        # 兼容遗留格式 CLICK:[123]，仅在单数字且没有坐标迹象时视为 CLICK_ID。
-        id_match = re.search(r"CLICK\s*[:=]\s*\[?\s*(\d+)\s*]?\s*$", action_block.strip(), re.IGNORECASE)
-        if id_match and "," not in action_block and "x" not in action_block.lower() and "y" not in action_block.lower():
-            return "CLICK_ID", {"id": int(id_match.group(1))}
 
     logger.warning(f"[解析失败兜底] 原始输出: {action_block}")
     return "CLICK", {"point": [500, 500]}

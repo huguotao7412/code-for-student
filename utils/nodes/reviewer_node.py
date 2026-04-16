@@ -1,8 +1,7 @@
 import json
 import logging
-from typing import Any, Dict, List
+from typing import Any, Dict
 
-from utils.a2a_protocol import A2AChannels, ensure_mailbox, read_payload, write_packet
 from utils.graph_state import WorkflowState
 
 logger = logging.getLogger(__name__)
@@ -28,67 +27,12 @@ def _extract_json_block(text: str) -> Dict[str, Any]:
     return {}
 
 
-def _count_action(history_actions: List[Dict[str, Any]], action_name: str) -> int:
-    target = action_name.upper()
-    return sum(
-        1
-        for item in (history_actions or [])
-        if isinstance(item, dict) and str(item.get("action", "")).upper() == target
-    )
-
-
-def _extract_type_text(action: str, params: Dict[str, Any]) -> str:
-    if action.upper() != "TYPE" or not isinstance(params, dict):
-        return ""
-    return str(params.get("text", params.get("content", ""))).strip()
-
-
-def _is_valid_point(point: Any) -> bool:
-    if not isinstance(point, list) or len(point) != 2:
-        return False
-    try:
-        int(point[0])
-        int(point[1])
-        return True
-    except Exception:
-        return False
-
-
-def _is_low_risk_fast_pass(action: str, params: Dict[str, Any], retry_count: int) -> bool:
-    if retry_count > 0:
-        return False
-    if action == "CLICK":
-        return _is_valid_point(params.get("point"))
-    if action == "SCROLL":
-        return _is_valid_point(params.get("start_point")) and _is_valid_point(params.get("end_point"))
-    return False
-
-
-def _review_reject(mailbox: Dict[str, Any], retry_count: int, feedback: str) -> Dict[str, Any]:
-    write_packet(
-        mailbox,
-        channel=A2AChannels.REVIEW,
-        sender="reviewer",
-        receiver="actor",
-        kind="review",
-        payload={"reviewer_feedback": feedback, "retry_count": retry_count + 1, "verdict": "REJECT"},
-    )
-    return {"mailbox": mailbox, "reviewer_feedback": feedback, "retry_count": retry_count + 1}
-
-
 def reviewer_node(state: WorkflowState, agent: Any) -> Dict[str, Any]:
-    mailbox = ensure_mailbox(state)
-    proposal = read_payload(state, A2AChannels.ACTION_PROPOSAL, default={}) or {}
-
-    action = str(proposal.get("proposed_action", state.get("proposed_action", ""))).upper()
-    params = proposal.get("proposed_params", state.get("proposed_params", {})) or {}
+    action = str(state.get("proposed_action", "")).upper()
+    params = state.get("proposed_params", {}) or {}
     input_data = state["input_data"]
     history_actions = state.get("history_actions") or input_data.history_actions or []
     retry_count = int(state.get("retry_count", 0))
-
-    task_type = str(state.get("task_type", "general"))
-    task_slots = state.get("task_slots") or {}
-    flow_flags = state.get("flow_flags") or {}
 
     last_action = ""
     if history_actions and isinstance(history_actions[-1], dict):
@@ -96,50 +40,34 @@ def reviewer_node(state: WorkflowState, agent: Any) -> Dict[str, Any]:
 
     instruction = input_data.instruction or ""
     is_search_task = any(k in instruction for k in ["搜索", "查找", "检索", "搜"])
+    is_play_task = any(k in instruction for k in ["播放", "收听", "听", "观看"])
     has_typed = any(
         isinstance(item, dict) and str(item.get("action", "")).upper() == "TYPE"
         for item in history_actions
     )
-    click_count = int(flow_flags.get("click_count", _count_action(history_actions, "CLICK")))
-    search_like = is_search_task or task_type in {"search", "food", "map", "flight"}
 
-    # 仅在“明显还处于输入链路且早期就要 COMPLETE”的场景做硬拦截，避免过拟合误拒绝。
-    if action == "COMPLETE" and search_like and not has_typed and click_count <= 2 and retry_count == 0:
-        return _review_reject(mailbox, retry_count, "REJECT: 输入链路可能尚未完成，请先激活输入框并 TYPE 后再 COMPLETE。")
-
-    if last_action == "TYPE" and action == "TYPE":
-        last_params = history_actions[-1].get("parameters", {}) if history_actions and isinstance(history_actions[-1], dict) else {}
-        last_text = _extract_type_text("TYPE", last_params)
-        current_text = _extract_type_text(action, params)
-        if not current_text or current_text == last_text:
-            return _review_reject(mailbox, retry_count, "REJECT: 连续执行 TYPE 且文本未变化。请优先 ENTER 或点击搜索/确认按钮。")
-
-    if search_like and not has_typed and action == "CLICK" and click_count >= 3 and retry_count == 0:
-        return _review_reject(mailbox, retry_count, "REJECT: 输入链路缺失。请先激活输入框并 TYPE 任务词。")
-
-    # 对低风险动作先走规则快审，减少 reviewer LLM 频率。
-    if action != "COMPLETE" and agent._should_fast_pass_review(action, params, retry_count):
-        write_packet(
-            mailbox,
-            channel=A2AChannels.REVIEW,
-            sender="reviewer",
-            receiver="actor",
-            kind="review",
-            payload={
-                "reviewer_feedback": "PASS",
-                "retry_count": retry_count,
-                "verdict": "PASS",
-                "review_source": "RULE_FAST_PASS",
-            },
-        )
+    # Rule 0: prevent premature completion before key search/play transitions.
+    if action == "COMPLETE" and is_search_task and not has_typed:
         return {
-            "mailbox": mailbox,
-            "reviewer_feedback": "PASS",
-            "retry_count": retry_count,
-            "review_source": "RULE_FAST_PASS",
+            "reviewer_feedback": "REJECT: 搜索任务尚未完成关键词输入与搜索确认，不能提前 COMPLETE。",
+            "retry_count": retry_count + 1,
         }
 
-    prompt = f"""你是移动端 GUI 动作审核员。你只负责判断当前候选动作是否与任务目标和截图证据一致。
+    # Rule 1: avoid repeated TYPE in consecutive steps.
+    if last_action == "TYPE" and action == "TYPE":
+        return {
+            "reviewer_feedback": "REJECT: 连续执行 TYPE。请优先 ENTER 或点击搜索/确认按钮。",
+            "retry_count": retry_count + 1,
+        }
+
+    # Rule 2: map flow usually needs entering destination field before another TYPE.
+    if ("地图" in instruction or "百度地图" in instruction) and last_action == "TYPE" and action == "TYPE":
+        return {
+            "reviewer_feedback": "REJECT: 地图双输入约束触发。请先点击终点输入入口，再输入终点。",
+            "retry_count": retry_count + 1,
+        }
+
+    prompt = f"""你是移动端 GUI 动作审核员。请审核 Actor 动作是否违反硬约束。
 仅输出 JSON：
 {{
   \"verdict\": \"PASS\" 或 \"REJECT\",
@@ -148,28 +76,31 @@ def reviewer_node(state: WorkflowState, agent: Any) -> Dict[str, Any]:
 }}
 
 任务：{instruction}
-任务类型：{task_type}
-任务槽位：{task_slots}
-流程标记：{flow_flags}
 历史动作：{history_actions[-3:] if history_actions else []}
 当前候选动作：{action}
 参数：{params}
 
-审核准则：
-1) 必须以当前截图可见证据为准，不依赖固定坐标模板。
-2) 搜索/输入任务优先保持 TYPE 链路完整：激活输入框 -> TYPE -> 确认。
-3) 地图类起终点任务保持双输入顺序：起点后先进入终点输入入口再 TYPE。
-4) 视频第N集和评论区任务保持播放优先。
-5) 刚 TYPE 后优先确认，不建议再次 TYPE。
-6) 仅在目标状态明确达成时允许 COMPLETE。
+审核清单：
+1) 若画面有弹窗/广告/权限遮挡，优先处理遮挡。
+2) 若动作是 TYPE，需确认输入框已激活（可见 caret）。
+3) 地图类任务中，起点后应先进入终点输入入口，再 TYPE 终点。
+4) 刚 TYPE 后通常应 ENTER 或点击确认控件，不应盲目再次 TYPE。
+5) 搜索任务中，若尚未 TYPE 任务词，不应跳过输入直接点内容结果区。
+6) 搜索任务中，完成链路应为“搜索框 TYPE -> 搜索确认(ENTER/搜索按钮) -> 结果选择”。
+7) 播放任务中，优先点击播放控件区域；若候选点击更像标题文本区域而非播放控件，应 REJECT 并给修正建议。
+
+补充上下文：
+- is_search_task={is_search_task}
+- is_play_task={is_play_task}
+- has_typed={has_typed}
+- last_action={last_action}
 """
 
-    current_image_url = agent._get_step_image_url(state, input_data)
     messages = [{
         "role": "user",
         "content": [
             {"type": "text", "text": prompt},
-            {"type": "image_url", "image_url": {"url": current_image_url}},
+            {"type": "image_url", "image_url": {"url": agent._encode_image(input_data.current_image)}},
         ],
     }]
 
@@ -181,26 +112,11 @@ def reviewer_node(state: WorkflowState, agent: Any) -> Dict[str, Any]:
         if verdict == "REJECT":
             reason = str(data.get("reason", "动作违反规则")).strip()
             advice = str(data.get("advice", "请先处理拦截项，再执行动作")).strip()
-            return _review_reject(mailbox, retry_count, f"REJECT: {reason}；建议：{advice}")
+            return {
+                "reviewer_feedback": f"REJECT: {reason}；建议：{advice}",
+                "retry_count": retry_count + 1,
+            }
     except Exception as e:
         logger.warning(f"Reviewer fallback to PASS: {e}")
 
-    write_packet(
-        mailbox,
-        channel=A2AChannels.REVIEW,
-        sender="reviewer",
-        receiver="actor",
-        kind="review",
-        payload={
-            "reviewer_feedback": "PASS",
-            "retry_count": retry_count,
-            "verdict": "PASS",
-            "review_source": "LLM",
-        },
-    )
-    return {
-        "mailbox": mailbox,
-        "reviewer_feedback": "PASS",
-        "retry_count": retry_count,
-        "review_source": "LLM",
-    }
+    return {"reviewer_feedback": "PASS"}
