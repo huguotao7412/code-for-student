@@ -24,6 +24,7 @@ from utils.nodes import actor_node, format_output_node, planner_node, reviewer_n
 from utils.parser import robust_parse
 from utils.state import GUIState
 from utils.vision_enhancer import add_coordinate_grid
+from utils.ui_detector import draw_som_labels
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +41,7 @@ class Agent(BaseAgent):
         self._task_plan = []
         self._current_instruction = ""
         self.graph = self._build_graph()
+        self._current_som_map = {}
 
     def _build_graph(self):
         if StateGraph is None:
@@ -78,6 +80,7 @@ class Agent(BaseAgent):
         self._plan_instruction = ""
         self._task_plan = []
         self._current_instruction = ""
+        self._current_som_map = {}
 
     @staticmethod
     def _recent_history(history_actions: list, window: int = 2) -> list:
@@ -97,12 +100,24 @@ class Agent(BaseAgent):
             return ""
 
     def _encode_image(self, image: Image.Image, image_format: str = "JPEG") -> str:
+        # ---------------------------------------------------------
+        # 终极视觉增强：Set-of-Mark (SoM) 靶向标记
+        # ---------------------------------------------------------
         try:
-            enhanced_image = add_coordinate_grid(image)
+            # 假设 draw_som_labels 返回 (标注后的图片对象, {id: [center_x, center_y]} 字典)
+            # 如果你的函数签名不同，请在此处微调解包逻辑
+            enhanced_image, som_map = draw_som_labels(image)
+            self._current_som_map = som_map or {}
+            logger.info(f"SoM 打标成功，共识别到 {len(self._current_som_map)} 个交互元素")
         except Exception as e:
-            logger.warning(f"网格渲染失败，降级使用原图: {e}")
-            enhanced_image = image.copy()
+            logger.warning(f"SoM 渲染失败，降级使用边缘标尺: {e}")
+            self._current_som_map = {}
+            try:
+                enhanced_image = add_coordinate_grid(image)
+            except:
+                enhanced_image = image.copy()
 
+        # 转换为 RGB (防 PNG 透明通道报错) 并限制最大边长为 1024
         img = enhanced_image.convert("RGB")
         max_size = 1024
         if max(img.size) > max_size:
@@ -280,9 +295,10 @@ Few-shot 示例：
 - [State: 终态验证]：目标结果已呈现，准备结束任务。
 
 [合法动作] (注意：严禁输出 ENTER 动作)
-CLICK / TYPE / SCROLL / OPEN / COMPLETE
+CLICK_ID / CLICK / TYPE / SCROLL / OPEN / COMPLETE
 
 [最高优先级规则]
+0) SoM 靶向点击绝对优先（致命硬约束）：你看到的截图上已经被系统标记了大量红色数字边框（Set-of-Mark）。如果你的目标元素上有数字标签（例如框上写着 5），你【必须】输出 CLICK_ID:[5] 来点击它，绝对禁止使用 CLICK:[[x,y]]！仅当目标极其微小且没有被打上数字标签时，才允许使用坐标 CLICK:[[x,y]]。
 1) 键盘禁区警告（致命硬约束）：本评测中，屏幕下方弹出的【系统虚拟键盘】属于非法点击区域！绝对禁止 CLICK 键盘上的任何区域（包括键盘上的搜索/回车键）。确认搜索必须 CLICK 页面内容区（通常在输入框右侧或联想词列表）的原生控件！
 2) 弹窗遮挡最高优先级：若存在广告或权限弹窗，必须先关掉再做其他动作。
 3) 输入框激活悖论：搜索框通常需点两次！第一次点击激活（出现光标 caret），此时才允许 TYPE。
@@ -307,7 +323,8 @@ CLICK / TYPE / SCROLL / OPEN / COMPLETE
 [Observe] 只描述当前屏幕可见事实
 [Analyze] 结合当前状态，判断下一步意图
 [Action] 仅一条动作，格式如下之一：
-CLICK:[[x,y]]
+CLICK_ID:[数字ID] (强烈推荐：直接点击带有数字标签的元素)
+CLICK:[[x,y]] (仅在目标无数字标签时的降级方案)
 TYPE:['文本']
 SCROLL:[[x1,y1],[x2,y2]]
 OPEN:['应用名']
@@ -353,7 +370,19 @@ COMPLETE:[]
         params = params or {}
 
         if action == "CLICK_ID":
-            return "CLICK", {"point": [500, 500]}, ""
+            element_id = params.get("id")
+            try:
+                element_id = int(element_id)  # 确保转换为整型键值
+            except:
+                pass
+
+            if element_id is not None and element_id in getattr(self, "_current_som_map", {}):
+                # 查表得到精准的像素中心点坐标
+                point = self._current_som_map[element_id]
+                return "CLICK", {"point": self._clip_norm_point(point)}, f"SoM精确打击: [标签 {element_id}]"
+            else:
+                logger.warning(f"模型输出了不存在的 CLICK_ID: {element_id}，降级为中心点点击")
+                return "CLICK", {"point": [500, 500]}, f"兜底点击 (未找到标签 {element_id})"
 
         # 【修复2】去掉了危险的 ENTER 强行映射 [900, 80] 的逻辑
 
@@ -440,6 +469,8 @@ COMPLETE:[]
         if model_effect and not expected_effect:
             expected_effect = model_effect
 
+        self._last_expected_effect = expected_effect or model_effect
+
         self.state.update(
             f"{action}:{params}",
             expected_effect or model_effect or "画面发生变化",
@@ -482,6 +513,7 @@ COMPLETE:[]
                     usage=final_state.get("usage"),
                 )
             expected_effect = final_state.get("expected_effect", "画面发生变化")
+            self._last_expected_effect = expected_effect
         except Exception as e:
             logger.warning(f"Graph invoke failed, fallback to legacy: {e}")
             return self._legacy_act(input_data)
