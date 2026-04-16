@@ -10,21 +10,34 @@ def reviewer_node(state: WorkflowState, agent: Any) -> Dict[str, Any]:
     action = str(state.get("proposed_action", "")).upper()
     params = state.get("proposed_params", {}) or {}
     input_data = state["input_data"]
+
+    # ---------------------------------------------------------
+    # 【新增 P3：双重历史提取】防止外部评测机传回空历史
+    # ---------------------------------------------------------
     history_actions = state.get("history_actions") or input_data.history_actions or []
+    internal_history = agent.state.action_history or []
+
     retry_count = int(state.get("retry_count", 0))
     raw_output = str(state.get("raw_output", ""))
 
+    # 提取最后一次动作
     last_action = ""
     if history_actions and isinstance(history_actions[-1], dict):
         last_action = str(history_actions[-1].get("action", "")).upper()
+    elif internal_history:
+        # 如果外部丢失，从内部格式 "ACTION:{...}" 中提取
+        last_action = internal_history[-1].split(":")[0].upper()
 
     instruction = input_data.instruction or ""
     is_search_task = any(k in instruction for k in ["搜索", "查找", "检索", "搜"])
 
-    has_typed = any(
+    # 判定是否执行过输入（双重保险）
+    has_typed_external = any(
         isinstance(item, dict) and str(item.get("action", "")).upper() == "TYPE"
         for item in history_actions
     )
+    has_typed_internal = any("TYPE" in str(act).upper() for act in internal_history)
+    has_typed = has_typed_external or has_typed_internal
 
     # ---------------------------------------------------------
     # 纯代码规则强拦截器 (0耗时，防早退)
