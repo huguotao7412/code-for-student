@@ -85,4 +85,10 @@ def reviewer_node(state: WorkflowState, agent: Any) -> Dict[str, Any]:
                 "retry_count": retry_count + 1,
             }
 
+    if action == "TYPE" and last_action not in ["CLICK", "OPEN"]:
+        return {
+            "reviewer_feedback": "REJECT: 🚨 输入框激活悖论触发！你尝试直接执行 TYPE 输入，但你上一步没有 CLICK 激活任何输入框。在移动端，你必须先 CLICK 点击搜索框或输入区域，确认出现竖线光标后，才能执行 TYPE。请修改动作为 CLICK，去点击目标输入区域。",
+            "retry_count": retry_count + 1,
+        }
+
     return {"reviewer_feedback": "PASS"}
