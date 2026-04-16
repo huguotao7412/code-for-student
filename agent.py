@@ -56,7 +56,8 @@ class Agent(BaseAgent):
         workflow.add_edge("actor", "reviewer")
 
         def _review_route(state: WorkflowState) -> str:
-            if state.get("reviewer_feedback") == "PASS" or int(state.get("retry_count", 0)) >= 2:
+            # 放宽到 3 次，让大模型有足够的回合阅读 Plan Reminder 并自我纠正
+            if state.get("reviewer_feedback") == "PASS" or int(state.get("retry_count", 0)) >= 3:
                 return "format_output"
             return "actor"
 
@@ -352,7 +353,7 @@ Few-shot 示例：
        - 地图类打车导航等通常有起点和终点两个输入入口，必须分开对待，且终点输入前必须先确认起点。
        - 起点确认后，必须先进入终点输入入口（常见文案“你要去哪儿”/终点占位条）再 TYPE 终点。
        - 未见终点输入框 caret或者输入键盘，不得直接 TYPE 终点词。
-    5) 输入后确认规则：刚 TYPE 后，优先点击页面原生 UI 上的“搜索/确认”按钮。
+    5) 提交动作强制链路：无论是搜索、发布评论、发送消息还是提交表单，TYPE 仅仅是把字打在框里。刚执行完 TYPE 后，【绝对禁止】直接 COMPLETE 或做其他无关操作，你的下一步【必须】是寻找并 CLICK 页面原生 UI 上的“发布 / 发送 / 搜索 / 确认”按钮，将数据真正提交出去！
     6) 搜索任务强制链路：
        - 只要任务包含“搜索/查找/检索”，必须先在搜索框 TYPE 任务词，再执行搜索确认。
        - 哪怕你一眼在推荐页看到了目标内容，也必须走搜索流程。

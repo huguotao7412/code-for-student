@@ -11,14 +11,14 @@ def format_output_node(state: WorkflowState, agent: Any) -> Dict[str, Any]:
     proposed_params = state.get("proposed_params", {"point": [500, 500]})
     feedback = state.get("reviewer_feedback", "")
 
-    # 【拦截逻辑】如果带着 REJECT 进来，说明重试耗尽且模型固执己见
+    # 【最终拦截逻辑】如果带着 REJECT 进来，说明重试 3 次耗尽模型依然固执己见
     if "REJECT" in feedback:
-        logger.error(f"模型重试耗尽，强制拦截毒药动作: {proposed_action}:{proposed_params}")
+        logger.error(f"模型重试耗尽，拦截毒药动作并执行边缘无害化点击")
         proposed_action = "CLICK"
-        # 兜底：点屏幕正中央或左上角，至少保证是一个合法的 CLICK 格式，避免评测脚本 KeyError
-        proposed_params = {"point": [500, 500]}
+        # 【修改点】：不再点屏幕中心 [500,500]，改为点屏幕最左上角 [10, 10] (状态栏白区)
+        # 这是一个无害动作，既不中断任务，也不引发误触，让其在下个循环再做打算。
+        proposed_params = {"point": [10, 10]}
 
-    # 1. 基础的动作标准化与边界裁剪
     action, params, expected_effect = agent._normalize_output(
         proposed_action,
         proposed_params,
