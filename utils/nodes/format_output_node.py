@@ -3,10 +3,8 @@ from typing import Any, Dict
 
 from agent_base import AgentOutput
 from utils.graph_state import WorkflowState
-from utils.action_sandbox import sanitize_and_stick
 
 logger = logging.getLogger(__name__)
-
 
 def format_output_node(state: WorkflowState, agent: Any) -> Dict[str, Any]:
     proposed_action = state.get("proposed_action", "CLICK")
@@ -25,10 +23,6 @@ def format_output_node(state: WorkflowState, agent: Any) -> Dict[str, Any]:
         proposed_action,
         proposed_params,
     )
-
-    # 【新增 P2：坐标精度纠偏】将归一化后的坐标通过 Sandbox 吸附到真实的 UI 元素中心
-    element_map = getattr(agent, "_current_element_map", {})
-    action, params = sanitize_and_stick(action, params, element_map)
 
     model_effect = state.get("model_effect", "")
     if model_effect and not expected_effect:

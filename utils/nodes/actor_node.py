@@ -15,7 +15,7 @@ def actor_node(state: WorkflowState, agent: Any) -> Dict[str, Any]:
     # Hash 死锁破局检测核心逻辑 (升级版)
     # --------------------------------------------------------------------
     curr_hash = agent._image_signature(input_data.current_image)
-    last_hash = getattr(agent, "_prev_image_hash", None)
+    last_hash = agent.state.last_visual_hash
 
     # 利用状态机中的 visual_repeat_count 来判断死锁深度
     repeat_count = agent.state.visual_repeat_count
@@ -41,7 +41,6 @@ def actor_node(state: WorkflowState, agent: Any) -> Dict[str, Any]:
                 )
                 logger.warning("检测到画面死锁，已向大模型注入强制纠偏警告！")
 
-    agent._prev_image_hash = curr_hash
     # --------------------------------------------------------------------
 
     prompt = agent._build_prompt(
