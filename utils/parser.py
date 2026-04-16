@@ -28,19 +28,17 @@ def robust_parse(raw_text: str) -> Tuple[str, Dict[str, Any]]:
         kv_match = re.search(r"TYPE\s*[:=]\s*\{[^}]*?(?:text|content)\s*[:=]\s*['\"](.*?)['\"]", action_block,
                              re.IGNORECASE)
         if kv_match:
-            return "TYPE", {"text": kv_match.group(1)}
+            return "TYPE", {"content": kv_match.group(1)}  # text 改为 content
         type_match = re.search(r"TYPE.*?['\"](.*?)['\"]", action_block, re.IGNORECASE)
         if type_match:
-            return "TYPE", {"text": type_match.group(1)}
+            return "TYPE", {"content": type_match.group(1)}  # text 改为 content
         type_tail = re.search(r"TYPE\s*[:=]\s*\[?\s*'?\"?(.*?)'?\"?\s*]?$", action_block, re.IGNORECASE)
         if type_tail:
-            return "TYPE", {"text": type_tail.group(1).strip("[]'\" ")}
+            return "TYPE", {"content": type_tail.group(1).strip("[]'\" ")}  # text 改为 content
 
     # 2) COMPLETE / ENTER
     if "COMPLETE" in upper:
         return "COMPLETE", {}
-    if "ENTER" in upper:
-        return "ENTER", {}
 
     # 3) SCROLL
     if "SCROLL" in upper:

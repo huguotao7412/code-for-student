@@ -12,10 +12,13 @@ def actor_node(state: WorkflowState, agent: Any) -> Dict[str, Any]:
     history_actions = input_data.history_actions or []
 
     # --------------------------------------------------------------------
-    # Hash 死锁破局检测核心逻辑
+    # Hash 死锁破局检测核心逻辑 (升级版)
     # --------------------------------------------------------------------
     curr_hash = agent._image_signature(input_data.current_image)
     last_hash = getattr(agent, "_prev_image_hash", None)
+
+    # 利用状态机中的 visual_repeat_count 来判断死锁深度
+    repeat_count = agent.state.visual_repeat_count
 
     deadlock_warning = ""
     if history_actions:
@@ -23,12 +26,22 @@ def actor_node(state: WorkflowState, agent: Any) -> Dict[str, Any]:
         last_action = str(last_action_dict.get("action", "")).upper()
 
         if last_action in ["CLICK", "SCROLL"] and last_hash and curr_hash == last_hash:
-            deadlock_warning = (
-                "\n🔴【系统强制警告】：你上一步执行的动作没有产生任何效果！屏幕画面没有任何变化。\n"
-                "这说明你上一步选择的坐标是无效的空白区域或发生了误触。\n"
-                "这一次【绝对禁止】点击或滑动之前的相同坐标！请仔细寻找页面上其他可交互的元素，或者尝试执行 SCROLL 探索新区域！\n"
-            )
-            logger.warning("检测到画面死锁，已向大模型注入强制纠偏警告！")
+            if repeat_count >= 2:
+                # 深度死锁：连续多次无效，下达最后通牒
+                deadlock_warning = (
+                    "\n🔥🔥🔥【系统最高级别警告：深度死锁】🔥🔥🔥\n"
+                    "你已经连续多次在同一个无响应页面上浪费操作！\n"
+                    "立即停止点击当前区域！如果你找不到目标，必须执行 SCROLL 大范围滑动屏幕寻找，或者点击页面上的【返回/关闭】按钮退出当前死胡同！\n"
+                    "如果再次重复相同动作，任务将被判定失败！\n\n"
+                )
+                logger.error("检测到深度画面死锁，已向大模型注入最高级别纠偏警告！")
+            else:
+                # 浅层死锁：首次无效
+                deadlock_warning = (
+                    "\n🔴【系统强制警告】：你上一步执行的动作没有产生任何效果！屏幕画面没有任何变化。\n"
+                    "说明上一步的坐标无效。这一次【绝对禁止】点击或滑动之前的相同坐标！请寻找其他 UI 元素或执行 SCROLL 探索！\n\n"
+                )
+                logger.warning("检测到画面死锁，已向大模型注入强制纠偏警告！")
 
     agent._prev_image_hash = curr_hash
     # --------------------------------------------------------------------

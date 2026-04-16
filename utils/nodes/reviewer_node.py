@@ -31,7 +31,8 @@ def reviewer_node(state: WorkflowState, agent: Any) -> Dict[str, Any]:
     # ---------------------------------------------------------
 
     if action == "COMPLETE":
-        if "[State: 终态验证]" not in raw_output:
+        # 放宽匹配条件，只要包含"终态验证"即可通过，防范缺少括号的幻觉
+        if "终态验证" not in raw_output:
             return {
                 "reviewer_feedback": "REJECT: 你尝试输出 COMPLETE，但你声明的当前状态不是 [State: 终态验证]。必须进入最终页面才能 COMPLETE。",
                 "retry_count": retry_count + 1,
@@ -44,8 +45,9 @@ def reviewer_node(state: WorkflowState, agent: Any) -> Dict[str, Any]:
         }
 
     if last_action == "TYPE" and action == "TYPE":
+        # 移除 ENTER 提示，引导模型去点击按钮
         return {
-            "reviewer_feedback": "REJECT: 连续执行 TYPE。请优先 ENTER 或点击搜索/确认按钮。",
+            "reviewer_feedback": "REJECT: 连续执行 TYPE。请优先寻找页面上的原生确认/搜索按钮执行 CLICK。",
             "retry_count": retry_count + 1,
         }
 
@@ -60,5 +62,14 @@ def reviewer_node(state: WorkflowState, agent: Any) -> Dict[str, Any]:
             "reviewer_feedback": "REJECT: 刚执行完 TYPE 输入，尚未点击搜索确认或进入详情页，不能直接 COMPLETE。",
             "retry_count": retry_count + 1,
         }
+
+    if action == "CLICK" and last_action == "TYPE":
+        point = params.get("point", [])
+        # 假设 1000x1000 的归一化坐标体系，y > 600 通常是虚拟键盘弹出的覆盖区
+        if len(point) == 2 and point[1] > 600:
+            return {
+                "reviewer_feedback": f"REJECT: 🚨 键盘禁区触发！你尝试点击的坐标 {point} 位于底部系统键盘区域。严禁点击系统键盘！请重新观察画面，寻找并点击页面上方的原生【搜索/确认】UI按钮。",
+                "retry_count": retry_count + 1,
+            }
 
     return {"reviewer_feedback": "PASS"}

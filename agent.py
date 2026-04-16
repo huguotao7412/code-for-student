@@ -86,8 +86,9 @@ class Agent(BaseAgent):
 
     def _image_signature(self, image) -> str:
         try:
-            thumb = image.convert("L").resize((32, 32))
-            return hashlib.sha1(thumb.tobytes()).hexdigest()
+            # 升级：256x256 RGB MD5 算法，保留色彩与高分辨率，对微小变化更敏感
+            thumb = image.convert("RGB").resize((256, 256))
+            return hashlib.md5(thumb.tobytes()).hexdigest()
         except Exception:
             return ""
 
@@ -295,14 +296,27 @@ Few-shot 示例：
         ) -> str:
             self._current_instruction = instruction or ""
             recent = self._recent_history(history_actions, window=2)
+
             review_section = ""
             if reviewer_feedback and reviewer_feedback != "PASS":
                 review_section = f"""
-    [Reviewer 反馈]
+    [Reviewer 强制打回]
     - 当前重试次数: {retry_count}
     - 审核意见: {reviewer_feedback}
-    - 🔴 你必须先修复审核意见，再给下一步动作！
+    - 🔴 你必须仔细阅读上述审核意见，放弃原有的错误想法，给出全新的合法动作！
     """
+
+            # 【新增】模块四：动态反馈闭环 - 视觉反思
+            visual_reflection = ""
+            if self.state.step_count > 0:
+                visual_status = "✅ 画面已发生实质变化" if self.state.last_visual_changed else "❌ 画面【毫无变化】"
+                visual_reflection = f"""
+    [视觉反思与核验 (核心痛觉)]
+    - 你上一步预期的效果是："{self.state.last_expected_effect}"
+    - 视觉系统判定结果：{visual_status}
+    - 💡 纠偏指南：如果画面毫无变化，说明你上一步点击了无效区域（白区、不可交互元素）或滑动触底！这一次【绝对禁止】重复上一步的坐标和策略，必须重新观察寻找新的可交互 UI 元素！
+    """
+
             return f"""你是 Android GUI 智能代理。每步必须按 ReAct：观察 -> 分析 -> 动作。
     任务目标：【{instruction}】
 
@@ -312,6 +326,8 @@ Few-shot 示例：
     - 步数: {self.state.step_count}/{self.state.max_steps}
     - 当前任务计划(4~8步):
     {self._plan_to_text()}
+
+    {visual_reflection}
     {review_section}
 
     [状态机声明（强制）]
@@ -324,7 +340,7 @@ Few-shot 示例：
     - [State: 终态验证]：目标结果已呈现（如视频在播放、商品已加购、路线已展示），准备结束任务。
 
     [合法动作]
-    CLICK / TYPE / SCROLL / OPEN / ENTER / COMPLETE
+    CLICK / TYPE / SCROLL / OPEN  / COMPLETE
 
     [最高优先级规则]
     1) 弹窗遮挡最高优先级：若存在广告或权限弹窗，必须先关掉再做其他动作。
@@ -333,12 +349,14 @@ Few-shot 示例：
        - 只要没有可见光标/竖线 caret，就一律视为“未激活”，先 CLICK 输入框聚焦。
        - 若搜索框已激活，禁止重复 CLICK 同一输入框。
     4) 地图双输入框规则：
+       - 地图类打车导航等通常有起点和终点两个输入入口，必须分开对待，且终点输入前必须先确认起点。
        - 起点确认后，必须先进入终点输入入口（常见文案“你要去哪儿”/终点占位条）再 TYPE 终点。
-       - 未见终点输入框 caret，不得直接 TYPE 终点词。
-    5) 输入后确认规则：刚 TYPE 后，优先点击页面原生 UI 上的“搜索/确认”按钮，或者使用 ENTER 动作。
+       - 未见终点输入框 caret或者输入键盘，不得直接 TYPE 终点词。
+    5) 输入后确认规则：刚 TYPE 后，优先点击页面原生 UI 上的“搜索/确认”按钮。
     6) 搜索任务强制链路：
        - 只要任务包含“搜索/查找/检索”，必须先在搜索框 TYPE 任务词，再执行搜索确认。
        - 哪怕你一眼在推荐页看到了目标内容，也必须走搜索流程。
+    7) 键盘禁区警告（物理防误触）：底部弹出的系统虚拟键盘（通常占据屏幕下半部分）是绝对的【非法点击区域】。如果需要确认搜索，必须寻找并点击页面内容区自带的原生“搜索/确认”按钮，绝对禁止输出键盘区域的坐标！
 
     [COMPLETE 触发规则]
     - 仅当状态为 [State: 终态验证] 且目标结果实质达成时，才允许 COMPLETE。
@@ -358,15 +376,15 @@ Few-shot 示例：
     [输出格式]
     请在最后一行输出最终动作。禁止在 [Analyze] 分析过程中使用格式化的坐标如 [[x, y]]，以免干扰解析！
     必须严格按以下结构输出（不可遗漏）：
-    [State] [State: 选择上述六个状态之一]
+    [State] 选择上述六个状态之一（必须包含方括号，例：[State: 寻找入口]）
+    [Goal Alignment] 一句话对比当前画面与最终任务目标（例：“当前在首页，距离把《三体》加入购物车还需先找到搜索入口”）
     [Observe] 只描述当前屏幕可见事实
-    [Analyze] 结合当前状态，判断下一步意图
+    [Analyze] 结合当前状态与全局进度，判断下一步意图
     [Action] 仅一条动作，格式如下之一：
     CLICK:[[x,y]]
     TYPE:['文本']
     SCROLL:[[x1,y1],[x2,y2]]
     OPEN:['应用名']
-    ENTER:[]
     COMPLETE:[]
     [Expected Effect] 简述执行后应看到的变化
     """
@@ -418,14 +436,6 @@ Few-shot 示例：
             # 赛题标准输出不要求 CLICK_ID，这里仅做安全退化。
             return "CLICK", {"point": [500, 500]}, ""
 
-        if action == "ENTER":
-            if isinstance(params, dict) and "point" in params:
-                return "CLICK", {"point": self._clip_norm_point(params["point"])}, "确认输入并继续"
-            if isinstance(params, dict) and "x" in params and "y" in params:
-                return "CLICK", {"point": self._clip_norm_point([params["x"], params["y"]])}, "确认输入并继续"
-            # 严格评测中 ENTER 常对应右上角确认/搜索按钮，避免中心兜底误点。
-            return "CLICK", {"point": [900, 80]}, "确认输入并继续"
-
         if action == "CLICK":
             if isinstance(params, dict) and "point" in params:
                 return "CLICK", {"point": self._clip_norm_point(params["point"])}, ""
@@ -436,9 +446,10 @@ Few-shot 示例：
         if action == "TYPE":
             text = ""
             if isinstance(params, dict):
-                text = params.get("text", params.get("content", ""))
+                # 兼容旧格式，但强制对齐官方 API
+                text = params.get("content", params.get("text", ""))
             checked = self._self_check_type_text(self._normalize_text(text))
-            return "TYPE", {"text": checked}, ""
+            return "TYPE", {"content": checked}, ""  # 必须输出 content 字段
 
         if action == "SCROLL":
             if isinstance(params, dict):
@@ -496,16 +507,6 @@ Few-shot 示例：
             raw_output = f"Fallback: {e}"
 
         action, params, expected_effect = self._normalize_output(model_action, model_params)
-
-        last_action = ""
-        if input_data.history_actions:
-            last = input_data.history_actions[-1]
-            if isinstance(last, dict):
-                last_action = str(last.get("action", "")).upper()
-        if last_action == "TYPE" and action == "TYPE":
-            action = "CLICK"
-            params = {"point": [900, 80]}
-            expected_effect = "确认输入并继续"
 
         if model_effect and not expected_effect:
             expected_effect = model_effect
