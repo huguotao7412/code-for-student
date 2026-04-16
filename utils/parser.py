@@ -74,7 +74,7 @@ def robust_parse(raw_text: str) -> Tuple[str, Dict[str, Any]]:
         if xy_match:
             return "CLICK", {"point": [int(xy_match.group(1)), int(xy_match.group(2))]}
 
-        exact_match = re.search(r"\[\s*(-?\d+)\s*,\s*(-?\d+)\s*]", action_block)
+        exact_match = re.search(r"CLICK.*?\[\s*(-?\d+)\s*,\s*(-?\d+)\s*]", action_block, flags=re.IGNORECASE)
         if exact_match:
             return "CLICK", {"point": [int(exact_match.group(1)), int(exact_match.group(2))]}
 

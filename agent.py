@@ -2,7 +2,9 @@
 from dotenv import load_dotenv
 
 load_dotenv()
-
+import io
+import base64
+from PIL import Image
 import hashlib
 import json
 import logging
@@ -21,6 +23,7 @@ from utils.graph_state import WorkflowState
 from utils.nodes import actor_node, format_output_node, planner_node, reviewer_node
 from utils.parser import robust_parse
 from utils.state import GUIState
+from utils.vision_enhancer import add_coordinate_grid
 
 logger = logging.getLogger(__name__)
 
@@ -29,11 +32,6 @@ class Agent(BaseAgent):
     """LLM 主导，最小 schema 适配。"""
 
     VALID_ACTIONS = {"CLICK", "SCROLL", "TYPE", "OPEN", "COMPLETE"}
-    MAP_CITY_PREFIXES = (
-        "北京", "上海", "广州", "深圳", "杭州", "南京", "苏州", "成都", "重庆", "武汉",
-        "天津", "西安", "长沙", "郑州", "青岛", "厦门", "宁波", "合肥", "福州", "济南",
-        "昆明", "沈阳", "大连", "南昌", "贵阳", "南宁", "石家庄", "太原", "哈尔滨", "长春",
-    )
 
     def _initialize(self):
         self.state = GUIState(max_steps=45)
@@ -92,6 +90,35 @@ class Agent(BaseAgent):
             return hashlib.sha1(thumb.tobytes()).hexdigest()
         except Exception:
             return ""
+
+    def _encode_image(self, image: Image.Image, image_format: str = "JPEG") -> str:
+        """
+        重写基类的图片编码方法：
+        1. 自动叠加 10x10 的半透明坐标网格增强空间感知。
+        2. 进行尺寸限制和 JPEG 压缩，大幅提升大模型 API 的传输与响应速度。
+        """
+        try:
+            # 1. 叠加网格，add_coordinate_grid 内部会 copy 图片
+            enhanced_image = add_coordinate_grid(image)
+        except Exception as e:
+            logger.warning(f"网格渲染失败，降级使用原图: {e}")
+            enhanced_image = image.copy()
+
+        # 2. 转换为 RGB (防 PNG 透明通道报错) 并限制最大边长为 1024
+        img = enhanced_image.convert("RGB")
+        max_size = 1024
+        if max(img.size) > max_size:
+            # 使用 LANCZOS 算法保证缩放后的图像清晰度
+            img.thumbnail((max_size, max_size), Image.Resampling.LANCZOS)
+
+        # 3. 压缩并转码
+        buffered = io.BytesIO()
+        # 使用 JPEG 格式并稍微压缩 (quality=85)，肉眼几乎无损，但体积大幅减小
+        img.save(buffered, format="JPEG", quality=85)
+        base64_str = base64.b64encode(buffered.getvalue()).decode("utf-8")
+
+        # 强制返回 image/jpeg 类型的 base64
+        return f"data:image/jpeg;base64,{base64_str}"
 
     def _build_plan_prompt(self, instruction: str) -> str:
         return f"""你是 GUI 任务规划器。请先理解任务，再输出 4~8 条结构化子步骤。
@@ -233,110 +260,108 @@ Few-shot 示例：
             logger.warning(f"Plan generation failed: {e}")
             self._task_plan = self._parse_plan("")
 
-    def _app_specific_hints(self, instruction: str) -> str:
+    def _scenario_hints(self, instruction: str) -> str:
         text = instruction or ""
         hints = []
-        if "抖音" in text:
-            hints.append("- 抖音：个人页/喜欢页常有放大镜搜索入口；优先点搜索控件，不因“喜欢”文案误点内容区。")
-        if "哔哩" in text or "b站" in text.lower() or "bilibili" in text.lower():
-            hints.append("- 哔哩哔哩：搜索通常是顶部输入框+确认按钮；输入后优先确认再选视频。")
-        if "爱奇艺" in text:
-            hints.append("- 爱奇艺：常先处理弹窗，再走搜索/剧集/评论链路。")
-        if "百度地图" in text or "地图" in text:
-            hints.append("- 地图类：起终点输入后常需点候选项确认，确认后再进入下一字段。")
-        if "喜马拉雅" in text:
-            hints.append("- 喜马拉雅：常见流程是搜索->结果->播放；播放状态可作为完成依据。")
-        if any(k in text for k in ["播放", "听", "收听", "观看"]):
-            hints.append("- 播放类：优先点击可见播放控件（播放键/继续播放按钮），不要把标题文本当作播放入口。")
-        return "\n".join(hints) if hints else "- 通用：优先跟随当前页面可见控件证据。"
+
+        # 1. 地图/导航/打车场景
+        if any(k in text for k in ["地图", "打车", "导航", "去", "前往", "路线", "目的地", "起点", "终点"]):
+            hints.append(
+                "- 地图/导航类：起终点输入后常需点候选项确认，确认后再进入下一字段。特别注意：未见终点输入框 caret，不得直接 TYPE 终点词。")
+
+        # 2. 视频/音频/播放场景
+        if any(k in text for k in ["播放", "听", "收听", "观看", "视频", "剧集", "电影", "有声"]):
+            hints.append(
+                "- 播放类：常见链路为 搜索 -> 选择结果 -> 触发播放。优先点击可见的播放控件（如播放键或带有“播放”二字的按钮），不要把单纯的标题文本当作播放入口。")
+
+        # 3. 购物/O2O/外卖场景
+        if any(k in text for k in ["买", "外卖", "商品", "店铺", "预订", "定一个", "酒店"]):
+            hints.append(
+                "- 购物/O2O类：注意处理各种促销或授权弹窗。购买或预订链路通常需找到具体的“加购物车”、“预订”、“选规格”或“结算”按钮。")
+
+        # 4. 通用搜索补丁
+        if any(k in text for k in ["搜索", "搜", "查找"]):
+            hints.append(
+                "- 搜索类通用：输入后务必优先点击确认/搜索控件（或回车），不要盲目点击下方的历史记录或内容区，除非明确要选历史词。")
+
+        return "\n".join(hints) if hints else "- 通用策略：优先跟随当前页面可见的 UI 控件证据，遇弹窗先关闭。"
 
     def _build_prompt(
-        self,
-        instruction: str,
-        history_actions: list,
-        reviewer_feedback: str = "",
-        retry_count: int = 0,
-    ) -> str:
-        self._current_instruction = instruction or ""
-        recent = self._recent_history(history_actions, window=2)
-        review_section = ""
-        if reviewer_feedback and reviewer_feedback != "PASS":
-            review_section = f"""
-[Reviewer 反馈]
-- 当前重试次数: {retry_count}
-- 审核意见: {reviewer_feedback}
-- 你必须先修复审核意见，再给下一步动作。
-"""
-        return f"""你是 Android GUI 智能代理。每步必须按 ReAct：观察 -> 分析 -> 动作。
-任务目标：【{instruction}】
+                self,
+                instruction: str,
+                history_actions: list,
+                reviewer_feedback: str = "",
+                retry_count: int = 0,
+        ) -> str:
+            self._current_instruction = instruction or ""
+            recent = self._recent_history(history_actions, window=2)
+            review_section = ""
+            if reviewer_feedback and reviewer_feedback != "PASS":
+                review_section = f"""
+    [Reviewer 反馈]
+    - 当前重试次数: {retry_count}
+    - 审核意见: {reviewer_feedback}
+    - 你必须先修复审核意见，再给下一步动作。
+    """
+            return f"""你是 Android GUI 智能代理。每步必须按 ReAct：观察 -> 分析 -> 动作。
+    任务目标：【{instruction}】
 
-[当前状态]
-- 历史摘要: {self.state.get_summary()}
-- 最近动作: {recent}
-- 步数: {self.state.step_count}/{self.state.max_steps}
-- 当前任务计划(4~8步):
-{self._plan_to_text()}
-{review_section}
-[合法动作]
-CLICK / TYPE / SCROLL / OPEN / ENTER / COMPLETE
+    [当前状态]
+    - 历史摘要: {self.state.get_summary()}
+    - 最近动作: {recent}
+    - 步数: {self.state.step_count}/{self.state.max_steps}
+    - 当前任务计划(4~8步):
+    {self._plan_to_text()}
+    {review_section}
+    [合法动作]
+    CLICK / TYPE / SCROLL / OPEN / ENTER / COMPLETE
 
-[最高优先级规则]
-1) 弹窗/广告/权限遮挡最高优先级：若存在遮挡，先处理遮挡再做其他动作。
-2) 搜索框状态规则（强约束，严格执行）：
-   - 只要没有可见光标/竖线 caret，就一律视为“未激活”，先 CLICK 输入框聚焦。
-   - 点击放大镜/搜索入口 ≠ 输入框已激活；点击入口后仍必须再次确认是否出现 caret。
-   - 仅当搜索框已激活（可见光标/竖线 caret）时，才允许 TYPE；禁止提前 TYPE。
-   - 若搜索框已激活，禁止重复 CLICK 同一输入框。
-3) 地图双输入框规则：
-   - 起点确认后，必须先进入终点输入入口（常见文案“你要去哪儿”/“终点”/终点占位条）再 TYPE 终点。
-   - 终点入口上的提示文案不等于已激活输入框；未见终点输入框 caret，不得直接 TYPE 终点词。
-   - 若已经在起点/结果页看到地点词，也不能跳过终点入口直接输入。
-4) 输入后确认规则：刚 TYPE 后，下一步优先 ENTER 或点击搜索/确认控件。
-5) 搜索任务强制链路：
-   - 只要任务包含“搜索/查找/检索”，必须先在搜索框 TYPE 任务词，再执行搜索确认（ENTER 或搜索按钮）。
-   - 即便内容区已经出现任务词，也不能跳过 TYPE 去直接点击内容结果。
-6) 播放任务点击规则：
-   - 目标是“播放/收听/观看”时，优先点击播放控件（播放键/继续播放按钮/播放器控制条）。
-   - 标题文本不是默认播放入口，除非界面证据明确显示标题本身可触发播放。
+    [最高优先级规则]
+    1) 弹窗/广告/权限遮挡最高优先级：若存在遮挡，先处理遮挡再做其他动作。
+    2) 搜索框状态规则（强约束，严格执行）：
+       - 只要没有可见光标/竖线 caret，就一律视为“未激活”，先 CLICK 输入框聚焦。
+       - 点击放大镜/搜索入口 ≠ 输入框已激活；点击入口后仍必须再次确认是否出现 caret。
+       - 仅当搜索框已激活（可见光标/竖线 caret）时，才允许 TYPE；禁止提前 TYPE。
+       - 若搜索框已激活，禁止重复 CLICK 同一输入框。
+    3) 地图双输入框规则：
+       - 起点确认后，必须先进入终点输入入口（常见文案“你要去哪儿”/“终点”/终点占位条）再 TYPE 终点。
+       - 终点入口上的提示文案不等于已激活输入框；未见终点输入框 caret，不得直接 TYPE 终点词。
+       - 若已经在起点/结果页看到地点词，也不能跳过终点入口直接输入。
+    4) 输入后确认规则：刚 TYPE 后，下一步优先 ENTER 或点击搜索/确认控件。
+    5) 搜索任务强制链路：
+       - 只要任务包含“搜索/查找/检索”，必须先在搜索框 TYPE 任务词，再执行搜索确认（ENTER 或搜索按钮）。
+       - 即便内容区已经出现任务词，也不能跳过 TYPE 去直接点击内容结果。
 
-[COMPLETE 触发规则]
-- 仅当目标结果已明确达成时才 COMPLETE，例如：已进入播放态、评论已发布、路线结果已展示。
-- 若还有关键后续动作（如确认搜索、选择结果、提交），不得提前 COMPLETE。
+    [COMPLETE 触发规则]
+    - 仅当目标结果已明确达成时才 COMPLETE，例如：已进入播放态、评论已发布、路线/酒店结果已展示。
+    - 若还有关键后续动作（如确认搜索、选择结果、点击预订），不得提前 COMPLETE。
 
-[测试集常见失分（分类经验，不是硬编码）]
-1) 动作类型错：应 TYPE/ENTER 却 CLICK，或应 CLICK 却 TYPE。
-2) 阶段判断错：输入后没有进入“确认搜索”阶段，继续重复输入或乱点内容区。
-3) 语义对齐错：把“文本相关词”当成“可点击入口”。
+    [文本输入规则（泛化要求）]
+    - 对于导航、打车或预订任务，提取文本时请自行判断是否需要包含“附近”或城市前缀，尽量输出能被搜索框精准识别的核心地标或完整诉求。
+    - 保证语义完整：如果用户说“定一个北京南站附近的酒店”，不要擅自截断为“北京”。
+    - 示例（地图类）：
+    - 错误：西安回民街 -> 正确：回民街
 
-[文本输入规则（严格评分）]
-- TYPE 文本优先使用任务里的核心地点词，尽量不带城市前缀或语义后缀。
-- 规则意图：在严格评测里，地点词常按核心关键词精确匹配，冗余前后缀易失分。
-- 示例（地图类）：
-  - 错误：西安回民街 -> 正确：回民街
-  - 错误：回民街附近 -> 正确：回民街
-  - 错误：去回民街 -> 正确：回民街
+    [UI 场景类别经验]
+    {self._scenario_hints(instruction)}
 
-[App 专属知识]
-{self._app_specific_hints(instruction)}
+    [反过拟合要求]
+    - 必须以当前截图可见证据为准，禁止依赖固定坐标或盲猜固定页面模板。
 
-[反过拟合要求]
-- 可以借鉴失败模式，但不要把本地样例当圣经。
-- 禁止依赖固定坐标、固定页面模板、固定步骤记忆；必须以当前截图可见证据为准。
-
-[输出格式]
-必须严格按以下结构输出：
-[Observe] 只描述当前屏幕可见事实
-[Analyze] 判断当前阶段与下一步意图
-[Action] 仅一条动作，格式如下之一：
-CLICK:[[x,y]]
-TYPE:['文本']
-SCROLL:[[x1,y1],[x2,y2]]
-OPEN:['应用名']
-ENTER:[]
-COMPLETE:[]
-[Expected Effect] 简述执行后应看到的变化
-"""
-
+    [输出格式]
+    请在最后一行输出最终动作。禁止在 [Analyze] 分析过程中使用格式化的坐标如 [[x, y]]，以免干扰解析！
+    必须严格按以下结构输出：：
+    [Observe] 只描述当前屏幕可见事实
+    [Analyze] 判断当前阶段与下一步意图
+    [Action] 仅一条动作，格式如下之一：
+    CLICK:[[x,y]]
+    TYPE:['文本']
+    SCROLL:[[x1,y1],[x2,y2]]
+    OPEN:['应用名']
+    ENTER:[]
+    COMPLETE:[]
+    [Expected Effect] 简述执行后应看到的变化
+    """
     @staticmethod
     def _parse_with_effect(raw_text: str) -> Tuple[str, Dict[str, Any], str]:
         action_block = raw_text
@@ -359,45 +384,21 @@ COMPLETE:[]
         return raw.strip().strip("'\" ")
 
     def _self_check_type_text(self, text: str) -> str:
-        """轻量自检：避免扩写尾缀，不做任意子串截断。"""
+        """轻量自检：剥离硬编码截断，完全交由大模型判断核心词汇。"""
         text = self._normalize_text(text)
         instruction = getattr(self, "_current_instruction", "") or ""
         if not text or not instruction:
             return text
 
-        # 地图/打车任务：剥离地点前缀，保留核心地点词（如“西安回民街”->“回民街”）。
-        if any(k in instruction for k in ["地图", "打车", "导航", "终点", "起点"]):
-            candidate = text
-            for prefix in ["去", "到", "前往", "导航到", "打车到", "目的地", "终点", "起点", "从"]:
-                if candidate.startswith(prefix) and len(candidate) > len(prefix) + 1:
-                    candidate = candidate[len(prefix):].strip()
-            for city in self.MAP_CITY_PREFIXES:
-                if candidate.startswith(city) and len(candidate) > len(city) + 1:
-                    candidate = candidate[len(city):].strip()
-                    break
-            for suffix in ["附近", "周边", "那边", "这里", "那儿"]:
-                if candidate.endswith(suffix) and len(candidate) > len(suffix) + 1:
-                    candidate = candidate[: -len(suffix)].strip()
-            if candidate:
-                text = candidate
-
-        # 若指令里存在书名号短语，且当前文本是其子串，优先补全为完整短语。
+        # 仅保留对书名号内容的保护补全，防止模型误截断《三体》这类剧名
         for match in re.findall(r"《[^》]+》[^，。！？；,!?;\n]*", instruction):
             phrase = match.strip()
             if text and text in phrase and len(text) < len(phrase):
                 return phrase
 
-        # 原文已出现在指令中，直接保留。
+        # 原文已出现在指令中，直接保留，不再暴力去尾
         if text in instruction:
             return text
-
-        # 仅清理常见扩写尾缀，避免把完整目标词截断成过短片段。
-        noisy_suffixes = ["的视频并查看", "的视频", "并查看", "附近", "周边"]
-        for suffix in noisy_suffixes:
-            if text.endswith(suffix):
-                candidate = text[: -len(suffix)].strip()
-                if candidate and candidate in instruction:
-                    return candidate
 
         return text
 
