@@ -371,18 +371,19 @@ COMPLETE:[]
 
         if action == "CLICK_ID":
             element_id = params.get("id")
-            try:
-                element_id = int(element_id)  # 确保转换为整型键值
-            except:
-                pass
+            if element_id is not None:
+                som_map = getattr(self, "_current_som_map", {})
+                # 兼容 int 和 str 类型的键，防止 Python 字典查不到
+                try:
+                    point = som_map.get(int(element_id)) or som_map.get(str(element_id))
+                except:
+                    point = None
 
-            if element_id is not None and element_id in getattr(self, "_current_som_map", {}):
-                # 查表得到精准的像素中心点坐标
-                point = self._current_som_map[element_id]
-                return "CLICK", {"point": self._clip_norm_point(point)}, f"SoM精确打击: [标签 {element_id}]"
-            else:
-                logger.warning(f"模型输出了不存在的 CLICK_ID: {element_id}，降级为中心点点击")
-                return "CLICK", {"point": [500, 500]}, f"兜底点击 (未找到标签 {element_id})"
+                if point:
+                    return "CLICK", {"point": self._clip_norm_point(point)}, f"SoM精确打击: [标签 {element_id}]"
+
+            logger.warning(f"模型输出了不存在的 CLICK_ID: {element_id}，降级为中心点点击")
+            return "CLICK", {"point": [500, 500]}, f"兜底点击 (未找到标签 {element_id})"
 
         # 【修复2】去掉了危险的 ENTER 强行映射 [900, 80] 的逻辑
 
