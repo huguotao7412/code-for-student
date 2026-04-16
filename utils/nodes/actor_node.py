@@ -12,23 +12,7 @@ def actor_node(state: WorkflowState, agent: Any) -> Dict[str, Any]:
     history_actions = input_data.history_actions or []
 
     # --------------------------------------------------------------------
-    # 核心增强 1：视觉反思 (Expected vs. Reality)
-    # --------------------------------------------------------------------
-    reflection_warning = ""
-    last_expectation = getattr(agent, "_last_expected_effect", None)
-
-    if history_actions and last_expectation:
-        reflection_warning = (
-            f"\n🔍【视觉反思（非常重要）】：\n"
-            f"你上一步的操作预期是：【{last_expectation}】。\n"
-            f"请你对比【当前最新截图】和你的预期：预期是否真正达成？\n"
-            f"- 如果预期未达成（如没看到弹窗、页面没跳转、搜索没结果），说明上一步点偏了或位置错误！\n"
-            f"- 你必须立即在 [Analyze] 中指出失败原因，并修正坐标或策略，绝对禁止重复之前的错误路径！\n"
-        )
-        logger.info(f"已注入视觉反思逻辑，预期为: {last_expectation}")
-
-    # --------------------------------------------------------------------
-    # 核心增强 2：Hash 死锁破局 (Visual Deadlock Breaker)
+    # Hash 死锁破局检测核心逻辑
     # --------------------------------------------------------------------
     curr_hash = agent._image_signature(input_data.current_image)
     last_hash = getattr(agent, "_prev_image_hash", None)
@@ -40,15 +24,15 @@ def actor_node(state: WorkflowState, agent: Any) -> Dict[str, Any]:
 
         if last_action in ["CLICK", "SCROLL"] and last_hash and curr_hash == last_hash:
             deadlock_warning = (
-                "\n🔴【系统死锁警告】：画面完全没变！你上一步的动作无效。\n"
-                "禁止再次点击相同的坐标！请寻找页面上其他按钮，或尝试 SCROLL 探索。\n"
+                "\n🔴【系统强制警告】：你上一步执行的动作没有产生任何效果！屏幕画面没有任何变化。\n"
+                "这说明你上一步选择的坐标是无效的空白区域或发生了误触。\n"
+                "这一次【绝对禁止】点击或滑动之前的相同坐标！请仔细寻找页面上其他可交互的元素，或者尝试执行 SCROLL 探索新区域！\n"
             )
-            logger.warning("检测到画面死锁，已注入强制纠偏警告！")
+            logger.warning("检测到画面死锁，已向大模型注入强制纠偏警告！")
 
     agent._prev_image_hash = curr_hash
     # --------------------------------------------------------------------
 
-    # 生成基础 Prompt
     prompt = agent._build_prompt(
         input_data.instruction,
         input_data.history_actions,
@@ -56,16 +40,13 @@ def actor_node(state: WorkflowState, agent: Any) -> Dict[str, Any]:
         retry_count=state.get("retry_count", 0),
     )
 
-    # 组合 Prompt：反思 > 死锁 > 基础指令
-    full_prompt = ""
-    if reflection_warning: full_prompt += reflection_warning
-    if deadlock_warning: full_prompt += deadlock_warning
-    full_prompt += prompt
+    if deadlock_warning:
+        prompt = deadlock_warning + prompt
 
     messages = [{
         "role": "user",
         "content": [
-            {"type": "text", "text": full_prompt},
+            {"type": "text", "text": prompt},
             {"type": "image_url", "image_url": {"url": agent._encode_image(input_data.current_image)}},
         ],
     }]

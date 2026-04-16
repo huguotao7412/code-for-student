@@ -30,15 +30,10 @@ def reviewer_node(state: WorkflowState, agent: Any) -> Dict[str, Any]:
     # 纯代码规则强拦截器 (0耗时，防早退)
     # ---------------------------------------------------------
 
-    # ---------------------------------------------------------
-    # 纯代码规则强拦截器 (0耗时，防早退)
-    # ---------------------------------------------------------
-
     if action == "COMPLETE":
-        # 只要没有提及“终态验证”，一律打回
-        if "终态验证" not in raw_output:
+        if "[State: 终态验证]" not in raw_output:
             return {
-                "reviewer_feedback": "REJECT: 你尝试输出 COMPLETE，但你声明的当前状态不是 [State: 终态验证]。必须进入最终结果页面（如视频播放页、商品详情页）才能 COMPLETE。",
+                "reviewer_feedback": "REJECT: 你尝试输出 COMPLETE，但你声明的当前状态不是 [State: 终态验证]。必须进入最终页面才能 COMPLETE。",
                 "retry_count": retry_count + 1,
             }
 

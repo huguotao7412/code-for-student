@@ -24,7 +24,6 @@ from utils.nodes import actor_node, format_output_node, planner_node, reviewer_n
 from utils.parser import robust_parse
 from utils.state import GUIState
 from utils.vision_enhancer import add_coordinate_grid
-from utils.ui_detector import draw_som_labels
 
 logger = logging.getLogger(__name__)
 
@@ -32,7 +31,6 @@ logger = logging.getLogger(__name__)
 class Agent(BaseAgent):
     """LLM 主导，最小 schema 适配。"""
 
-    # 【修复1】严格对齐官方 5 大动作，彻底铲除 ENTER
     VALID_ACTIONS = {"CLICK", "SCROLL", "TYPE", "OPEN", "COMPLETE"}
 
     def _initialize(self):
@@ -41,7 +39,6 @@ class Agent(BaseAgent):
         self._task_plan = []
         self._current_instruction = ""
         self.graph = self._build_graph()
-        self._current_som_map = {}
 
     def _build_graph(self):
         if StateGraph is None:
@@ -80,7 +77,6 @@ class Agent(BaseAgent):
         self._plan_instruction = ""
         self._task_plan = []
         self._current_instruction = ""
-        self._current_som_map = {}
 
     @staticmethod
     def _recent_history(history_actions: list, window: int = 2) -> list:
@@ -89,43 +85,39 @@ class Agent(BaseAgent):
         return history_actions[-window:]
 
     def _image_signature(self, image) -> str:
-        """
-        离线评测中，即便只多出一个输入光标（Caret），也必须能被识别为不同状态。
-        """
         try:
-            # 缩放到 256x256 且保留色彩，足以保留光标等微小 UI 变化
-            thumb = image.resize((256, 256))
-            return hashlib.md5(thumb.tobytes()).hexdigest()
+            thumb = image.convert("L").resize((32, 32))
+            return hashlib.sha1(thumb.tobytes()).hexdigest()
         except Exception:
             return ""
 
     def _encode_image(self, image: Image.Image, image_format: str = "JPEG") -> str:
-        # ---------------------------------------------------------
-        # 终极视觉增强：Set-of-Mark (SoM) 靶向标记
-        # ---------------------------------------------------------
+        """
+        重写基类的图片编码方法：
+        1. 自动叠加 10x10 的半透明坐标网格增强空间感知。
+        2. 进行尺寸限制和 JPEG 压缩，大幅提升大模型 API 的传输与响应速度。
+        """
         try:
-            # 假设 draw_som_labels 返回 (标注后的图片对象, {id: [center_x, center_y]} 字典)
-            # 如果你的函数签名不同，请在此处微调解包逻辑
-            enhanced_image, som_map = draw_som_labels(image)
-            self._current_som_map = som_map or {}
-            logger.info(f"SoM 打标成功，共识别到 {len(self._current_som_map)} 个交互元素")
+            # 1. 叠加网格，add_coordinate_grid 内部会 copy 图片
+            enhanced_image = add_coordinate_grid(image)
         except Exception as e:
-            logger.warning(f"SoM 渲染失败，降级使用边缘标尺: {e}")
-            self._current_som_map = {}
-            try:
-                enhanced_image = add_coordinate_grid(image)
-            except:
-                enhanced_image = image.copy()
+            logger.warning(f"网格渲染失败，降级使用原图: {e}")
+            enhanced_image = image.copy()
 
-        # 转换为 RGB (防 PNG 透明通道报错) 并限制最大边长为 1024
+        # 2. 转换为 RGB (防 PNG 透明通道报错) 并限制最大边长为 1024
         img = enhanced_image.convert("RGB")
         max_size = 1024
         if max(img.size) > max_size:
+            # 使用 LANCZOS 算法保证缩放后的图像清晰度
             img.thumbnail((max_size, max_size), Image.Resampling.LANCZOS)
 
+        # 3. 压缩并转码
         buffered = io.BytesIO()
+        # 使用 JPEG 格式并稍微压缩 (quality=85)，肉眼几乎无损，但体积大幅减小
         img.save(buffered, format="JPEG", quality=85)
         base64_str = base64.b64encode(buffered.getvalue()).decode("utf-8")
+
+        # 强制返回 image/jpeg 类型的 base64
         return f"data:image/jpeg;base64,{base64_str}"
 
     def _build_plan_prompt(self, instruction: str) -> str:
@@ -177,6 +169,30 @@ Few-shot 示例：
 {{"id":6,"stage":"结束","goal":"任务完成","action_hint":"COMPLETE"}}
 ]}}
 
+[示例4]
+任务：去抖音我的喜欢里搜索跳舞的视频并查看
+{{"sub_steps":[
+{{"id":1,"stage":"进入个人页","goal":"切换到个人页","action_hint":"CLICK"}},
+{{"id":2,"stage":"进入喜欢Tab","goal":"点击喜欢标签","action_hint":"CLICK"}},
+{{"id":3,"stage":"进入搜索","goal":"点击搜索图标","action_hint":"CLICK"}},
+{{"id":4,"stage":"输入关键词","goal":"输入跳舞","action_hint":"TYPE"}},
+{{"id":5,"stage":"确认搜索","goal":"执行搜索","action_hint":"CLICK"}},
+{{"id":6,"stage":"查看结果","goal":"点击一个结果视频查看","action_hint":"CLICK"}},
+{{"id":7,"stage":"结束","goal":"任务完成","action_hint":"COMPLETE"}}
+]}}
+
+[示例5]
+任务：去百度地图打车，从A到B
+{{"sub_steps":[
+{{"id":1,"stage":"打开应用","goal":"进入百度地图","action_hint":"OPEN"}},
+{{"id":2,"stage":"进入打车","goal":"点击打车入口","action_hint":"CLICK"}},
+{{"id":3,"stage":"输入起点","goal":"输入并选择起点","action_hint":"TYPE"}},
+{{"id":4,"stage":"确认起点","goal":"从候选项选择起点","action_hint":"CLICK"}},
+{{"id":5,"stage":"输入终点","goal":"输入并选择终点","action_hint":"TYPE"}},
+{{"id":6,"stage":"确认终点","goal":"从候选项选择终点","action_hint":"CLICK"}},
+{{"id":7,"stage":"结束","goal":"任务完成","action_hint":"COMPLETE"}}
+]}}
+
 现在请只针对下面任务生成计划：
 任务：{instruction}
 """
@@ -211,6 +227,8 @@ Few-shot 示例：
                 return parsed
         except Exception:
             pass
+
+        # 解析失败时，退化为可用的通用计划，避免首步无计划。
         return [
             {"id": 1, "stage": "打开或进入目标应用", "goal": "到达任务主场景", "action_hint": "OPEN"},
             {"id": 2, "stage": "定位入口", "goal": "找到搜索/功能入口", "action_hint": "CLICK"},
@@ -245,92 +263,113 @@ Few-shot 示例：
     def _scenario_hints(self, instruction: str) -> str:
         text = instruction or ""
         hints = []
+
+        # 1. 地图/导航/打车场景
         if any(k in text for k in ["地图", "打车", "导航", "去", "前往", "路线", "目的地", "起点", "终点"]):
             hints.append(
                 "- 地图/导航类：起终点输入后常需点候选项确认，确认后再进入下一字段。特别注意：未见终点输入框 caret，不得直接 TYPE 终点词。")
+
+        # 2. 视频/音频/播放场景
         if any(k in text for k in ["播放", "听", "收听", "观看", "视频", "剧集", "电影", "有声"]):
             hints.append(
-                "- 播放类：常见链路为 搜索 -> 选择结果 -> 触发播放。优先点击可见的播放控件，不要把单纯的标题文本当作播放入口。")
+                "- 播放类：常见链路为 搜索 -> 选择结果 -> 触发播放。优先点击可见的播放控件（如播放键或带有“播放”二字的按钮），不要把单纯的标题文本当作播放入口。")
+
+        # 3. 购物/O2O/外卖场景
         if any(k in text for k in ["买", "外卖", "商品", "店铺", "预订", "定一个", "酒店"]):
-            hints.append("- 购物/O2O类：注意处理各种促销或授权弹窗。优先寻找“加购物车”、“预订”或“结算”按钮。")
+            hints.append(
+                "- 购物/O2O类：注意处理各种促销或授权弹窗。购买或预订链路通常需找到具体的“加购物车”、“预订”、“选规格”或“结算”按钮。")
+
+        # 4. 通用搜索补丁
         if any(k in text for k in ["搜索", "搜", "查找"]):
-            hints.append("- 搜索类通用：输入后务必 CLICK 原页面上方或右侧的原生搜索按钮！")
+            hints.append(
+                "- 搜索类通用：输入后务必优先点击确认/搜索控件（或回车），不要盲目点击下方的历史记录或内容区，除非明确要选历史词。")
+
         return "\n".join(hints) if hints else "- 通用策略：优先跟随当前页面可见的 UI 控件证据，遇弹窗先关闭。"
 
     def _build_prompt(
-            self,
-            instruction: str,
-            history_actions: list,
-            reviewer_feedback: str = "",
-            retry_count: int = 0,
-    ) -> str:
-        self._current_instruction = instruction or ""
-        recent = self._recent_history(history_actions, window=2)
-        review_section = ""
-        if reviewer_feedback and reviewer_feedback != "PASS":
-            review_section = f"""
-[Reviewer 反馈]
-- 当前重试次数: {retry_count}
-- 审核意见: {reviewer_feedback}
-- 🔴 你必须先修复审核意见，再给下一步动作！
-"""
-        return f"""你是 Android GUI 智能代理。每步必须按 ReAct：观察 -> 分析 -> 动作。
-任务目标：【{instruction}】
+                self,
+                instruction: str,
+                history_actions: list,
+                reviewer_feedback: str = "",
+                retry_count: int = 0,
+        ) -> str:
+            self._current_instruction = instruction or ""
+            recent = self._recent_history(history_actions, window=2)
+            review_section = ""
+            if reviewer_feedback and reviewer_feedback != "PASS":
+                review_section = f"""
+    [Reviewer 反馈]
+    - 当前重试次数: {retry_count}
+    - 审核意见: {reviewer_feedback}
+    - 🔴 你必须先修复审核意见，再给下一步动作！
+    """
+            return f"""你是 Android GUI 智能代理。每步必须按 ReAct：观察 -> 分析 -> 动作。
+    任务目标：【{instruction}】
 
-[当前状态]
-- 历史摘要: {self.state.get_summary()}
-- 最近动作: {recent}
-- 步数: {self.state.step_count}/{self.state.max_steps}
-- 当前任务计划(4~8步):
-{self._plan_to_text()}
-{review_section}
+    [当前状态]
+    - 历史摘要: {self.state.get_summary()}
+    - 最近动作: {recent}
+    - 步数: {self.state.step_count}/{self.state.max_steps}
+    - 当前任务计划(4~8步):
+    {self._plan_to_text()}
+    {review_section}
 
-[状态机声明（强制）]
-在分析之前，你必须严格评估并声明当前所处的任务状态，只能从以下状态库中选择一个：
-- [State: 寻找入口]：目标是找搜索框/分类等起始入口。
-- [State: 处理弹窗]：目标是关掉广告/权限确认/升级提示等遮挡物。
-- [State: 文本输入]：目标是打字（必须确认光标已在输入框内）。
-- [State: 确认搜索]：目标是点击页面上的原生搜索按钮确认输入。
-- [State: 结果筛选]：目标是在列表中浏览并点击正确结果。
-- [State: 终态验证]：目标结果已呈现，准备结束任务。
+    [状态机声明（强制）]
+    在分析之前，你必须严格评估并声明当前所处的任务状态，只能从以下状态库中选择一个：
+    - [State: 寻找入口]：目标是找搜索框/分类等起始入口。
+    - [State: 处理弹窗]：目标是关掉广告/权限确认/升级提示等遮挡物。
+    - [State: 文本输入]：目标是打字（必须确认光标已在输入框内）。
+    - [State: 确认搜索]：目标是点击页面上的搜索按钮确认输入。
+    - [State: 结果筛选]：目标是在列表中浏览、对比并点击正确的目标结果。
+    - [State: 终态验证]：目标结果已呈现（如视频在播放、商品已加购、路线已展示），准备结束任务。
 
-[合法动作] (注意：严禁输出 ENTER 动作)
-CLICK_ID / CLICK / TYPE / SCROLL / OPEN / COMPLETE
+    [合法动作]
+    CLICK / TYPE / SCROLL / OPEN / ENTER / COMPLETE
 
-[最高优先级规则]
-0) SoM 靶向点击绝对优先（致命硬约束）：你看到的截图上已经被系统标记了大量红色数字边框（Set-of-Mark）。如果你的目标元素上有数字标签（例如框上写着 5），你【必须】输出 CLICK_ID:[5] 来点击它，绝对禁止使用 CLICK:[[x,y]]！仅当目标极其微小且没有被打上数字标签时，才允许使用坐标 CLICK:[[x,y]]。
-1) 键盘禁区警告（致命硬约束）：本评测中，屏幕下方弹出的【系统虚拟键盘】属于非法点击区域！绝对禁止 CLICK 键盘上的任何区域（包括键盘上的搜索/回车键）。确认搜索必须 CLICK 页面内容区（通常在输入框右侧或联想词列表）的原生控件！
-2) 弹窗遮挡最高优先级：若存在广告或权限弹窗，必须先关掉再做其他动作。
-3) 输入框激活悖论：搜索框通常需点两次！第一次点击激活（出现光标 caret），此时才允许 TYPE。
-4) 搜索框状态规则：只要没有可见光标 caret，就一律视为“未激活”，先 CLICK 聚焦。若已激活，禁止重复 CLICK。
-5) 地图双输入框：起点确认后，必须先进入终点输入入口再 TYPE 终点。
-6) 输入后确认规则：刚 TYPE 后，禁止盲目连续 TYPE，必须 CLICK 页面原生 UI 里的“搜索/确认”按键。
+    [最高优先级规则]
+    1) 弹窗遮挡最高优先级：若存在广告或权限弹窗，必须先关掉再做其他动作。
+    2) 输入框激活悖论（移动端硬约束）：搜索框通常需要点两次！第一次点击激活（出现光标 caret），此时才允许 TYPE。千万不要以为看到放大镜图标或提示文字就可以直接 TYPE！若无光标，必须先 CLICK。
+    3) 搜索框状态规则：
+       - 只要没有可见光标/竖线 caret，就一律视为“未激活”，先 CLICK 输入框聚焦。
+       - 若搜索框已激活，禁止重复 CLICK 同一输入框。
+    4) 地图双输入框规则：
+       - 起点确认后，必须先进入终点输入入口（常见文案“你要去哪儿”/终点占位条）再 TYPE 终点。
+       - 未见终点输入框 caret，不得直接 TYPE 终点词。
+    5) 输入后确认规则：刚 TYPE 后，优先点击页面原生 UI 上的“搜索/确认”按钮，或者使用 ENTER 动作。
+    6) 搜索任务强制链路：
+       - 只要任务包含“搜索/查找/检索”，必须先在搜索框 TYPE 任务词，再执行搜索确认。
+       - 哪怕你一眼在推荐页看到了目标内容，也必须走搜索流程。
 
-[COMPLETE 触发规则]
-- 仅当状态为 [State: 终态验证] 且目标结果实质达成时，才允许 COMPLETE。
+    [COMPLETE 触发规则]
+    - 仅当状态为 [State: 终态验证] 且目标结果实质达成时，才允许 COMPLETE。
+    - 若还有关键后续动作（如确认搜索、点击进入视频详情页），绝对不得提前 COMPLETE。
 
-[文本输入规则]
-- 提取文本时请自行判断是否需要包含“附近”或城市前缀。保证语义完整。
-- 示例（地图类）：错误：西安回民街 -> 正确：回民街
+    [文本输入规则（泛化要求）]
+    - 对于导航、打车或预订任务，提取文本时请自行判断是否需要包含“附近”或城市前缀，尽量输出能被搜索框精准识别的核心地标。
+    - 保证语义完整：如果用户说“定一个北京南站附近的酒店”，不要擅自截断为“北京”。
+    - 示例（地图类）：错误：西安回民街 -> 正确：回民街
 
-[UI 场景类别经验]
-{self._scenario_hints(instruction)}
+    [UI 场景类别经验]
+    {self._scenario_hints(instruction)}
 
-[输出格式]
-请在最后一行输出最终动作。禁止在 [Analyze] 中使用坐标 [[x, y]] 以免干扰解析！
-必须严格按以下结构输出：
-[State] [State: 选择上述六个状态之一]
-[Observe] 只描述当前屏幕可见事实
-[Analyze] 结合当前状态，判断下一步意图
-[Action] 仅一条动作，格式如下之一：
-CLICK_ID:[数字ID] (强烈推荐：直接点击带有数字标签的元素)
-CLICK:[[x,y]] (仅在目标无数字标签时的降级方案)
-TYPE:['文本']
-SCROLL:[[x1,y1],[x2,y2]]
-OPEN:['应用名']
-COMPLETE:[]
-[Expected Effect] 简述执行后应看到的变化
-"""
+    [反过拟合要求]
+    - 必须以当前截图可见证据为准，禁止依赖固定坐标。
+
+    [输出格式]
+    请在最后一行输出最终动作。禁止在 [Analyze] 分析过程中使用格式化的坐标如 [[x, y]]，以免干扰解析！
+    必须严格按以下结构输出（不可遗漏）：
+    [State] [State: 选择上述六个状态之一]
+    [Observe] 只描述当前屏幕可见事实
+    [Analyze] 结合当前状态，判断下一步意图
+    [Action] 仅一条动作，格式如下之一：
+    CLICK:[[x,y]]
+    TYPE:['文本']
+    SCROLL:[[x1,y1],[x2,y2]]
+    OPEN:['应用名']
+    ENTER:[]
+    COMPLETE:[]
+    [Expected Effect] 简述执行后应看到的变化
+    """
 
     @staticmethod
     def _parse_with_effect(raw_text: str) -> Tuple[str, Dict[str, Any], str]:
@@ -338,8 +377,7 @@ COMPLETE:[]
         if "[Action]" in raw_text:
             action_block = raw_text.split("[Action]")[-1].split("[Expected Effect]")[0]
         action, params = robust_parse(action_block)
-        expected_effect = raw_text.split("[Expected Effect]")[
-            -1].strip() if "[Expected Effect]" in raw_text else "画面发生变化"
+        expected_effect = raw_text.split("[Expected Effect]")[-1].strip() if "[Expected Effect]" in raw_text else "画面发生变化"
         return action, params, expected_effect
 
     @staticmethod
@@ -351,41 +389,42 @@ COMPLETE:[]
     @staticmethod
     def _normalize_text(text: Any) -> str:
         raw = "" if text is None else str(text)
+        # 只去掉模型常见外层包装，不碰正文。
         return raw.strip().strip("'\" ")
 
     def _self_check_type_text(self, text: str) -> str:
+        """轻量自检：剥离硬编码截断，完全交由大模型判断核心词汇。"""
         text = self._normalize_text(text)
         instruction = getattr(self, "_current_instruction", "") or ""
         if not text or not instruction:
             return text
+
+        # 仅保留对书名号内容的保护补全，防止模型误截断《三体》这类剧名
         for match in re.findall(r"《[^》]+》[^，。！？；,!?;\n]*", instruction):
             phrase = match.strip()
             if text and text in phrase and len(text) < len(phrase):
                 return phrase
+
+        # 原文已出现在指令中，直接保留，不再暴力去尾
         if text in instruction:
             return text
+
         return text
 
     def _normalize_output(self, action: str, params: dict) -> Tuple[str, dict, str]:
         params = params or {}
 
         if action == "CLICK_ID":
-            element_id = params.get("id")
-            if element_id is not None:
-                som_map = getattr(self, "_current_som_map", {})
-                # 兼容 int 和 str 类型的键，防止 Python 字典查不到
-                try:
-                    point = som_map.get(int(element_id)) or som_map.get(str(element_id))
-                except:
-                    point = None
+            # 赛题标准输出不要求 CLICK_ID，这里仅做安全退化。
+            return "CLICK", {"point": [500, 500]}, ""
 
-                if point:
-                    return "CLICK", {"point": self._clip_norm_point(point)}, f"SoM精确打击: [标签 {element_id}]"
-
-            logger.warning(f"模型输出了不存在的 CLICK_ID: {element_id}，降级为中心点点击")
-            return "CLICK", {"point": [500, 500]}, f"兜底点击 (未找到标签 {element_id})"
-
-        # 【修复2】去掉了危险的 ENTER 强行映射 [900, 80] 的逻辑
+        if action == "ENTER":
+            if isinstance(params, dict) and "point" in params:
+                return "CLICK", {"point": self._clip_norm_point(params["point"])}, "确认输入并继续"
+            if isinstance(params, dict) and "x" in params and "y" in params:
+                return "CLICK", {"point": self._clip_norm_point([params["x"], params["y"]])}, "确认输入并继续"
+            # 严格评测中 ENTER 常对应右上角确认/搜索按钮，避免中心兜底误点。
+            return "CLICK", {"point": [900, 80]}, "确认输入并继续"
 
         if action == "CLICK":
             if isinstance(params, dict) and "point" in params:
@@ -399,8 +438,7 @@ COMPLETE:[]
             if isinstance(params, dict):
                 text = params.get("text", params.get("content", ""))
             checked = self._self_check_type_text(self._normalize_text(text))
-            # 必须包含官方要求的 'content' 字段，为了兼容性同时保留 'text'
-            return "TYPE", {"content": checked, "text": checked}, ""
+            return "TYPE", {"text": checked}, ""
 
         if action == "SCROLL":
             if isinstance(params, dict):
@@ -464,13 +502,13 @@ COMPLETE:[]
             last = input_data.history_actions[-1]
             if isinstance(last, dict):
                 last_action = str(last.get("action", "")).upper()
-
-        # 【修复4】去掉了危险的 legacy 连续 TYPE 回退 [900, 80] 的逻辑，交给 Reviewer 阻断
+        if last_action == "TYPE" and action == "TYPE":
+            action = "CLICK"
+            params = {"point": [900, 80]}
+            expected_effect = "确认输入并继续"
 
         if model_effect and not expected_effect:
             expected_effect = model_effect
-
-        self._last_expected_effect = expected_effect or model_effect
 
         self.state.update(
             f"{action}:{params}",
@@ -514,7 +552,6 @@ COMPLETE:[]
                     usage=final_state.get("usage"),
                 )
             expected_effect = final_state.get("expected_effect", "画面发生变化")
-            self._last_expected_effect = expected_effect
         except Exception as e:
             logger.warning(f"Graph invoke failed, fallback to legacy: {e}")
             return self._legacy_act(input_data)
@@ -527,3 +564,4 @@ COMPLETE:[]
         self.state.last_image = input_data.current_image.copy()
 
         return output
+
