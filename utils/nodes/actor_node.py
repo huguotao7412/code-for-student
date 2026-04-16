@@ -12,6 +12,7 @@ def actor_node(state: WorkflowState, agent: Any) -> Dict[str, Any]:
     mailbox = ensure_mailbox(state)
     review_payload = read_payload(state, A2AChannels.REVIEW, default={}) or {}
     feedback = str(review_payload.get("reviewer_feedback", state.get("reviewer_feedback", "")))
+    current_image_url = str(state.get("current_image_url", "") or "") or agent._encode_image(input_data.current_image)
 
     prompt = agent._build_prompt(
         input_data.instruction,
@@ -23,7 +24,7 @@ def actor_node(state: WorkflowState, agent: Any) -> Dict[str, Any]:
         "role": "user",
         "content": [
             {"type": "text", "text": prompt},
-            {"type": "image_url", "image_url": {"url": agent._encode_image(input_data.current_image)}},
+            {"type": "image_url", "image_url": {"url": current_image_url}},
         ],
     }]
 

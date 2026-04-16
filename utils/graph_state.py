@@ -10,6 +10,7 @@ class WorkflowState(TypedDict, total=False):
     task_plan: List[Dict[str, Any]]
     history_actions: List[Dict[str, Any]]
     mailbox: Dict[str, A2AMessage]
+    current_image_url: str
 
     # Task profiling for rule-based stage guards.
     task_type: str

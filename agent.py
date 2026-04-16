@@ -30,7 +30,7 @@ class Agent(BaseAgent):
     """LLM 主导，最小 schema 适配。"""
 
     VALID_ACTIONS = {"CLICK", "SCROLL", "TYPE", "OPEN", "COMPLETE"}
-    REVIEW_MAX_RETRY = 2
+    REVIEW_MAX_RETRY = 1
     TASK_TYPE_KEYWORDS = {
         "map": ["地图", "导航", "打车", "路线", "起点", "终点"],
         "flight": ["航班", "机票", "出发", "到达", "去哪儿旅行", "去哪旅行"],
@@ -92,6 +92,7 @@ class Agent(BaseAgent):
         self._plan_instruction = ""
         self._task_plan = []
         self._current_instruction = ""
+        self._openai_client = None
         self.graph = self._build_graph()
 
     def _build_graph(self):
@@ -248,18 +249,19 @@ class Agent(BaseAgent):
             {"id": 6, "stage": "完成", "goal": "任务结束", "action_hint": "COMPLETE", "input_text": ""},
         ]
 
-    def _ensure_task_plan(self, instruction: str, current_image) -> None:
+    def _ensure_task_plan(self, instruction: str, current_image, current_image_url: str = "") -> None:
         if self._plan_instruction == instruction and self._task_plan:
             return
 
         self._plan_instruction = instruction
         self._task_plan = []
         plan_prompt = self._build_plan_prompt(instruction)
+        image_url = current_image_url or self._encode_image(current_image)
         messages = [{
             "role": "user",
             "content": [
                 {"type": "text", "text": plan_prompt},
-                {"type": "image_url", "image_url": {"url": self._encode_image(current_image)}},
+                {"type": "image_url", "image_url": {"url": image_url}},
             ],
         }]
         try:
@@ -602,7 +604,8 @@ COMPLETE:[]
 
     def _build_initial_state(self, input_data: AgentInput) -> WorkflowState:
         task_type, task_slots, flow_flags = self._build_task_profile(input_data.instruction, input_data.history_actions)
-        return {
+        current_image_url = self._encode_image(input_data.current_image)
+        state: Dict[str, Any] = {
             "input_data": input_data,
             "plan_instruction": self._plan_instruction,
             "task_plan": self._task_plan,
@@ -611,6 +614,7 @@ COMPLETE:[]
             "task_type": task_type,
             "task_slots": task_slots,
             "flow_flags": flow_flags,
+            "current_image_url": current_image_url,
             "proposed_action": "",
             "proposed_params": {},
             "model_effect": "",
@@ -619,6 +623,7 @@ COMPLETE:[]
             "raw_output": "",
             "usage": None,
         }
+        return cast(WorkflowState, cast(object, state))
 
     def _run_fallback_workflow(self, initial_state: WorkflowState) -> WorkflowState:
         # Graph 不可用时，按同一节点顺序执行，保持与多 agent 编排一致。
@@ -714,12 +719,13 @@ COMPLETE:[]
                 "评测已终止。"
             )
 
-        try:
-            from openai import OpenAI
-        except ImportError:
-            raise ImportError("请安装 openai 包: pip install openai")
+        if self._openai_client is None:
+            try:
+                from openai import OpenAI
+            except ImportError:
+                raise ImportError("请安装 openai 包: pip install openai")
+            self._openai_client = OpenAI(base_url=self._api_url, api_key=self._api_key)
 
-        client = OpenAI(base_url=self._api_url, api_key=self._api_key)
         logger.info(f"[API调用] model={self._model_id}, url={self._api_url}")
 
         user_extra_body = safe_kwargs.pop("extra_body", None)
@@ -727,6 +733,7 @@ COMPLETE:[]
         if isinstance(user_extra_body, dict):
             extra_body.update(user_extra_body)
 
+        client = cast(Any, self._openai_client)
         return client.chat.completions.create(
             model=self._model_id,
             messages=messages,

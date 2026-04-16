@@ -43,6 +43,27 @@ def _extract_type_text(action: str, params: Dict[str, Any]) -> str:
     return str(params.get("text", params.get("content", ""))).strip()
 
 
+def _is_valid_point(point: Any) -> bool:
+    if not isinstance(point, list) or len(point) != 2:
+        return False
+    try:
+        int(point[0])
+        int(point[1])
+        return True
+    except Exception:
+        return False
+
+
+def _is_low_risk_fast_pass(action: str, params: Dict[str, Any], retry_count: int) -> bool:
+    if retry_count > 0:
+        return False
+    if action == "CLICK":
+        return _is_valid_point(params.get("point"))
+    if action == "SCROLL":
+        return _is_valid_point(params.get("start_point")) and _is_valid_point(params.get("end_point"))
+    return False
+
+
 def _review_reject(mailbox: Dict[str, Any], retry_count: int, feedback: str) -> Dict[str, Any]:
     write_packet(
         mailbox,
@@ -96,6 +117,18 @@ def reviewer_node(state: WorkflowState, agent: Any) -> Dict[str, Any]:
     if search_like and not has_typed and action == "CLICK" and click_count >= 3 and retry_count == 0:
         return _review_reject(mailbox, retry_count, "REJECT: 输入链路缺失。请先激活输入框并 TYPE 任务词。")
 
+    # 对低风险动作先走规则快审，减少 reviewer LLM 频率。
+    if action != "COMPLETE" and _is_low_risk_fast_pass(action, params, retry_count):
+        write_packet(
+            mailbox,
+            channel=A2AChannels.REVIEW,
+            sender="reviewer",
+            receiver="actor",
+            kind="review",
+            payload={"reviewer_feedback": "PASS", "retry_count": retry_count, "verdict": "PASS"},
+        )
+        return {"mailbox": mailbox, "reviewer_feedback": "PASS", "retry_count": retry_count}
+
     prompt = f"""你是移动端 GUI 动作审核员。你只负责判断当前候选动作是否与任务目标和截图证据一致。
 仅输出 JSON：
 {{
@@ -121,11 +154,12 @@ def reviewer_node(state: WorkflowState, agent: Any) -> Dict[str, Any]:
 6) 仅在目标状态明确达成时允许 COMPLETE。
 """
 
+    current_image_url = str(state.get("current_image_url", "") or "") or agent._encode_image(input_data.current_image)
     messages = [{
         "role": "user",
         "content": [
             {"type": "text", "text": prompt},
-            {"type": "image_url", "image_url": {"url": agent._encode_image(input_data.current_image)}},
+            {"type": "image_url", "image_url": {"url": current_image_url}},
         ],
     }]
 
