@@ -86,9 +86,13 @@ class Agent(BaseAgent):
         return history_actions[-window:]
 
     def _image_signature(self, image) -> str:
+        """
+        离线评测中，即便只多出一个输入光标（Caret），也必须能被识别为不同状态。
+        """
         try:
-            thumb = image.convert("L").resize((32, 32))
-            return hashlib.sha1(thumb.tobytes()).hexdigest()
+            # 缩放到 256x256 且保留色彩，足以保留光标等微小 UI 变化
+            thumb = image.resize((256, 256))
+            return hashlib.md5(thumb.tobytes()).hexdigest()
         except Exception:
             return ""
 
@@ -365,7 +369,7 @@ COMPLETE:[]
             if isinstance(params, dict):
                 text = params.get("text", params.get("content", ""))
             checked = self._self_check_type_text(self._normalize_text(text))
-            # 【修复3】同时返回 content 和 text，完美兼容官方解析器
+            # 必须包含官方要求的 'content' 字段，为了兼容性同时保留 'text'
             return "TYPE", {"content": checked, "text": checked}, ""
 
         if action == "SCROLL":
