@@ -118,16 +118,26 @@ def reviewer_node(state: WorkflowState, agent: Any) -> Dict[str, Any]:
         return _review_reject(mailbox, retry_count, "REJECT: 输入链路缺失。请先激活输入框并 TYPE 任务词。")
 
     # 对低风险动作先走规则快审，减少 reviewer LLM 频率。
-    if action != "COMPLETE" and _is_low_risk_fast_pass(action, params, retry_count):
+    if action != "COMPLETE" and agent._should_fast_pass_review(action, params, retry_count):
         write_packet(
             mailbox,
             channel=A2AChannels.REVIEW,
             sender="reviewer",
             receiver="actor",
             kind="review",
-            payload={"reviewer_feedback": "PASS", "retry_count": retry_count, "verdict": "PASS"},
+            payload={
+                "reviewer_feedback": "PASS",
+                "retry_count": retry_count,
+                "verdict": "PASS",
+                "review_source": "RULE_FAST_PASS",
+            },
         )
-        return {"mailbox": mailbox, "reviewer_feedback": "PASS", "retry_count": retry_count}
+        return {
+            "mailbox": mailbox,
+            "reviewer_feedback": "PASS",
+            "retry_count": retry_count,
+            "review_source": "RULE_FAST_PASS",
+        }
 
     prompt = f"""你是移动端 GUI 动作审核员。你只负责判断当前候选动作是否与任务目标和截图证据一致。
 仅输出 JSON：
@@ -154,7 +164,7 @@ def reviewer_node(state: WorkflowState, agent: Any) -> Dict[str, Any]:
 6) 仅在目标状态明确达成时允许 COMPLETE。
 """
 
-    current_image_url = str(state.get("current_image_url", "") or "") or agent._encode_image(input_data.current_image)
+    current_image_url = agent._get_step_image_url(state, input_data)
     messages = [{
         "role": "user",
         "content": [
@@ -181,6 +191,16 @@ def reviewer_node(state: WorkflowState, agent: Any) -> Dict[str, Any]:
         sender="reviewer",
         receiver="actor",
         kind="review",
-        payload={"reviewer_feedback": "PASS", "retry_count": retry_count, "verdict": "PASS"},
+        payload={
+            "reviewer_feedback": "PASS",
+            "retry_count": retry_count,
+            "verdict": "PASS",
+            "review_source": "LLM",
+        },
     )
-    return {"mailbox": mailbox, "reviewer_feedback": "PASS", "retry_count": retry_count}
+    return {
+        "mailbox": mailbox,
+        "reviewer_feedback": "PASS",
+        "retry_count": retry_count,
+        "review_source": "LLM",
+    }

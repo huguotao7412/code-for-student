@@ -10,6 +10,7 @@ class WorkflowState(TypedDict, total=False):
     task_plan: List[Dict[str, Any]]
     history_actions: List[Dict[str, Any]]
     mailbox: Dict[str, A2AMessage]
+    encoded_image_url: str
     current_image_url: str
 
     # Task profiling for rule-based stage guards.
@@ -23,6 +24,7 @@ class WorkflowState(TypedDict, total=False):
 
     reviewer_feedback: str
     retry_count: int
+    review_source: str
 
     raw_output: str
     usage: Optional[UsageInfo]
@@ -32,4 +34,3 @@ class WorkflowState(TypedDict, total=False):
     expected_effect: str
 
     final_output: AgentOutput
-

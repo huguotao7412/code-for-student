@@ -6,7 +6,7 @@ from utils.graph_state import WorkflowState
 
 def planner_node(state: WorkflowState, agent: Any) -> Dict[str, Any]:
     input_data = state["input_data"]
-    current_image_url = str(state.get("current_image_url", "") or "")
+    current_image_url = agent._get_step_image_url(state, input_data)
     need_plan = (
         input_data.step_count <= 1
         or state.get("plan_instruction") != input_data.instruction

@@ -48,12 +48,15 @@ class Agent(BaseAgent):
         "去哪旅行": "去哪儿旅行",
     }
     PROMPT_CORE_RULES = [
-        "- 所有判断以当前截图可见控件为准，不依赖固定坐标或固定模板。",
-        "- 若有弹窗/广告/权限遮挡，优先处理遮挡。",
-        "- TYPE 文本优先使用任务原文关键词，禁止同义改写。",
+        "- 屏幕截图上已用红框/蓝框标记了带数字 ID 的控件。强烈优先使用 CLICK_ID:[数字] 进行精确点击！",
+        "- 只有在目标位置确实没有数字标记框时，才退化使用 CLICK:[[x,y]] (0-1000归一化坐标)。",
+        "- 计划赶不上变化：当前的“任务计划”仅供参考。如果遇到弹窗、广告、权限请求遮挡，必须立刻中断原计划，本步的唯一目标是关闭遮挡物！",
+        "- 所有判断以当前截图可见控件为准，绝对不依赖固定坐标或凭空想象的页面模板。",
+        "- TYPE 文本时，必须剥离任务指令中的动词前缀（如“去”、“导航到”、“搜索”），仅输入核心实体名词。若需精确模糊匹配，可自行使用 .* 作为前缀。",
         "- 若刚执行 TYPE，下一步优先 ENTER 或点击搜索/确认控件。",
         "- 只在目标状态明确达成时才输出 COMPLETE。",
     ]
+
     PROMPT_STRATEGIES = {
         "search": [
             "- 搜索链路必须是：激活搜索框 -> TYPE 任务词 -> 搜索确认。",
@@ -108,7 +111,23 @@ class Agent(BaseAgent):
 
         workflow.add_edge(START, "planner")
         workflow.add_edge("planner", "actor")
-        workflow.add_edge("actor", "reviewer")
+
+        def _actor_route(state: WorkflowState) -> str:
+            action = str(state.get("proposed_action", "")).upper()
+            params = state.get("proposed_params", {}) or {}
+            retry_count = int(state.get("retry_count", 0))
+            if self._should_fast_pass_review(action, params, retry_count):
+                return "format_output"
+            return "reviewer"
+
+        workflow.add_conditional_edges(
+            "actor",
+            _actor_route,
+            {
+                "reviewer": "reviewer",
+                "format_output": "format_output",
+            },
+        )
 
         def _review_route(state: WorkflowState) -> str:
             review_payload = read_payload(state, A2AChannels.REVIEW, default={}) or {}
@@ -156,12 +175,12 @@ class Agent(BaseAgent):
 2) JSON 格式：
 {{
   \"sub_steps\": [
-    {{\"id\": 1, \"stage\": \"阶段名\", \"goal\": \"要完成什么\", \"action_hint\": \"OPEN/CLICK/TYPE/SCROLL/COMPLETE\", \"input_text\": \"仅TYPE步骤必填，输入原样关键词\"}}
+    {{\"id\": 1, \"stage\": \"阶段名\", \"goal\": \"要完成什么\", \"action_hint\": \"OPEN/CLICK/TYPE/SCROLL/COMPLETE\", \"input_text\": \"如果是TYPE步骤，请填入提取出的纯净核心名词\"}}
   ]
 }}
 3) 计划要可迁移，不依赖固定坐标、固定 App 或固定页面模板。
 4) 优先使用任务意图驱动（例如：搜索、输入确认、结果选择、发布、播放、地图起终点）。
-5) TYPE 步骤必须先从任务中提取关键词，并保持原样输入：禁止同义改写、禁止随意裁剪前后缀。
+5) TYPE 步骤必须聪明地提取：剥离“去”、“导航到”、“搜索”等行为动词，仅保留核心实体名词。
 6) 搜索任务必须拆成“激活搜索框 -> TYPE任务词 -> 搜索确认”，不能用点击内容区同名词替代 TYPE。
 7) 应用名归一化：任务提到“美团外卖”时先 OPEN “美团”再进入外卖入口；任务提到“去哪旅行”时使用“去哪儿旅行”。
 8) 搜索入口可为文字按钮、标准放大镜或斜放的🔍/🔎图标。
@@ -300,69 +319,80 @@ class Agent(BaseAgent):
         return "\n".join(hints)
 
     def _build_prompt(
-        self,
-        instruction: str,
-        history_actions: list,
-        reviewer_feedback: str = "",
-        retry_count: int = 0,
-    ) -> str:
-        stuck_warning = ""
-        if self.state.stuck_level >= 2:
-            stuck_warning = "\n[系统警告] 你似乎陷入了死循环，请立即改变策略（如先处理遮挡、换入口、或执行一次有效滚动）。"
-        self._current_instruction = instruction or ""
-        recent = self._recent_history(history_actions, window=2)
-        task_type, task_slots, flow_flags = self._build_task_profile(instruction, history_actions)
+                self,
+                instruction: str,
+                history_actions: list,
+                reviewer_feedback: str = "",
+                retry_count: int = 0,
+        ) -> str:
+            stuck_warning = ""
+            if self.state.stuck_level >= 2:
+                stuck_warning = "\n[系统警告] 你似乎陷入了死循环，画面可能没有变化！请立即改变策略（如：换一个入口、尝试关闭潜在的透明弹窗、或执行一次 SCROLL 滑动以刷新页面）。"
 
-        review_section = ""
-        if reviewer_feedback and reviewer_feedback != "PASS":
-            review_section = f"""
-[Reviewer 反馈]
-- 当前重试次数: {retry_count}
-- 审核意见: {reviewer_feedback}
-- 必须先修复该问题，再给下一步动作。
-"""
+            self._current_instruction = instruction or ""
+            recent = self._recent_history(history_actions, window=2)
+            task_type, task_slots, flow_flags = self._build_task_profile(instruction, history_actions)
 
-        policy = self._app_specific_hints(instruction, task_type=task_type, flow_flags=flow_flags)
+            # === 动态反思链增强：提取上一步的期望效果 ===
+            last_expected_effect = "无（当前为第一步）"
+            if history_actions and isinstance(history_actions[-1], dict):
+                last_raw = history_actions[-1].get("raw_output", "")
+                if "[Expected Effect]" in last_raw:
+                    last_expected_effect = last_raw.split("[Expected Effect]")[-1].strip()
+            # ==========================================
 
-        return f"""你是 Android GUI 智能代理。每一步按 ReAct 输出：观察 -> 分析 -> 动作。
-任务目标：【{instruction}】
+            review_section = ""
+            if reviewer_feedback and reviewer_feedback != "PASS":
+                review_section = f"""
+    [Reviewer 反馈]
+    - 当前重试次数: {retry_count}
+    - 审核意见: {reviewer_feedback}
+    - 必须先修复该问题，再给下一步动作。
+    """
 
-[当前状态]
-- 历史摘要: {self.state.get_summary()}
-- 最近动作: {recent}
-- 步数: {self.state.step_count}/{self.state.max_steps}
-- 当前任务计划(4~8步):
-{self._plan_to_text()}
-{review_section}
-{stuck_warning}
+            policy = self._app_specific_hints(instruction, task_type=task_type, flow_flags=flow_flags)
 
-[合法动作]
-CLICK / TYPE / SCROLL / OPEN / ENTER / COMPLETE
+            return f"""你是 Android GUI 智能代理。每一步必须按 ReAct 框架进行严谨的逻辑推理。
+    任务目标：【{instruction}】
 
-[关键策略]
-{policy}
+    [当前状态]
+    - 历史摘要: {self.state.get_summary()}
+    - 最近动作: {recent}
+    - 上一步期望看到的变化: {last_expected_effect}
+    - 步数: {self.state.step_count}/{self.state.max_steps}
+    - 当前宏观任务计划(仅供参考，遇遮挡须灵活变通):
+    {self._plan_to_text()}
+    {review_section}
+    {stuck_warning}
 
-[任务画像]
-- task_type={task_type}
-- task_slots={task_slots}
-- flow_flags={flow_flags}
+    [合法动作]
+    CLICK_ID / CLICK / TYPE / SCROLL / OPEN / ENTER / COMPLETE
 
-[坐标系统]
-当前屏幕坐标为归一化 1000x1000：左上 [0,0]，右下 [1000,1000]。
-CLICK 和 SCROLL 的坐标必须在 0~1000。
+    [关键策略]
+    {policy}
 
-[输出格式]
-[Observe] 只描述当前屏幕可见事实
-[Analyze] 判断当前阶段与下一步意图
-[Action] 仅一条动作，格式如下之一：
-CLICK:[[x,y]]
-TYPE:['文本']
-SCROLL:[[x1,y1],[x2,y2]]
-OPEN:['应用名']
-ENTER:[]
-COMPLETE:[]
-[Expected Effect] 执行后应看到的变化
-"""
+    [任务画像]
+    - task_type={task_type}
+    - task_slots={task_slots}
+    - flow_flags={flow_flags}
+
+    [坐标系统]
+    当前屏幕坐标为归一化 1000x1000：左上 [0,0]，右下 [1000,1000]。
+    如果目标没有数字ID，CLICK 和 SCROLL 的坐标必须在 0~1000。
+
+    [输出格式]
+    [Observe] 1. 当前画面最核心的特征是什么？ 2. 仔细检查：画面中是否有浮层弹窗、广告、或者权限申请？
+    [Analyze] 1. 反思：当前画面是否达成了“上一步期望看到的变化”？ 2. 决策：如果有弹窗遮挡，本步最高优先级是找到并点击它的关闭/跳过按钮；如果没有遮挡，结合宏观计划，决定现在的具体目标。
+    [Action] 仅一条动作，格式如下之一：
+    CLICK_ID:[数字ID]
+    CLICK:[[x,y]]
+    TYPE:['文本']
+    SCROLL:[[x1,y1],[x2,y2]]
+    OPEN:['应用名']
+    ENTER:[]
+    COMPLETE:[]
+    [Expected Effect] 预判该动作执行后，画面应发生什么变化
+    """
 
     @staticmethod
     def _parse_with_effect(raw_text: str) -> Tuple[str, Dict[str, Any], str]:
@@ -455,16 +485,6 @@ COMPLETE:[]
         needs_comment_area = any(k in (instruction or "") for k in ["评论区", "讨论区", "评论", "讨论"])
         is_voice_package_task = any(k in (instruction or "") for k in ["语音包", "导航语音", "语音", "更换语音"])
 
-        play_started = False
-        for item in hist:
-            click_point = _hist_click_point(item)
-            if not click_point:
-                continue
-            _, y = click_point
-            if 260 <= y <= 560:
-                play_started = True
-                break
-
         search_like = task_type in {"search", "food", "flight", "map"} or any(
             k in (instruction or "") for k in ["搜索", "查找", "检索", "搜"]
         )
@@ -478,65 +498,37 @@ COMPLETE:[]
             "has_episode_target": has_episode_target,
             "needs_comment_area": needs_comment_area,
             "is_voice_package_task": is_voice_package_task,
-            "play_started": play_started,
             "search_reactivate_needed": search_reactivate_needed,
         }
         return task_type, slots, flow_flags
 
     def _self_check_type_text(self, text: str) -> str:
-        """轻量自检：原样保留优先，仅在可证明安全时裁剪。"""
+        """轻量自检：移除硬编码地点词，信任模型提取的核心名词，仅做基础补全和兜底。"""
         text = self._normalize_text(text)
         instruction = getattr(self, "_current_instruction", "") or ""
         if not text or not instruction:
             return text
 
-        is_map_like = any(k in instruction for k in ["地图", "导航", "打车", "路线", "起点", "终点"])
-
-        # 兼容评测数据中的特殊写法：某些样例期望字面值 "*国际医学中心"。
-        if "国际医学中心" in instruction and "国际医学中心" in text and not text.startswith(".*"):
-            return ".*国际医学中心"
-
-        # 地图地点词优先去城市前缀：例如“西安回民街” -> “回民街”。
-        for city in self.MAP_CITY_PREFIXES:
-            if text.startswith(city) and len(text) > len(city) + 1:
-                tail = text[len(city):].strip()
-                if tail and tail in instruction:
-                    if is_map_like and tail.endswith("回民街"):
-                        return ".*回民街"
-                    return tail
-
-        if is_map_like and text.endswith("回民街") and "回民街" in instruction and not text.startswith(".*"):
-            return ".*回民街"
-
-        # 若指令里存在书名号短语，且当前文本是其子串，优先补全为完整短语。
+        # 泛化策略：若指令里存在书名号短语（如《狂飙》），且当前文本是其子串，优先补全为完整短语
         for match in re.findall(r"《[^》]+》[^，。！？；,!?;\n]*", instruction):
             phrase = match.strip()
             if text and text in phrase and len(text) < len(phrase):
                 return phrase
 
-        # 原文已出现在指令中，直接保留，避免误裁。
+        # 如果大模型加上了 .* 前缀且主体在指令中，信任大模型的正则决策
+        if text.startswith(".*") and text[2:] in instruction:
+            return text
+
+        # 兜底：如果模型提取的文本确实在指令里，原样返回即可
         if text in instruction:
             return text
 
-        # 仅在“裁剪后词条仍完整出现在指令中”时，允许轻量裁剪。
-        candidates = []
-        if "去" in text and text.startswith("从"):
-            part = text.split("去", 1)[1].strip()
-            if part:
-                candidates.append(part)
-        for prefix in ["去", "到", "前往", "导航到", "打车到", "目的地", "终点", "起点", "从"]:
-            if text.startswith(prefix) and len(text) > len(prefix) + 1:
-                candidates.append(text[len(prefix):].strip())
-        for city in self.MAP_CITY_PREFIXES:
-            if text.startswith(city) and len(text) > len(city) + 1:
-                candidates.append(text[len(city):].strip())
-        for suffix in ["附近", "周边", "那边", "这里", "那儿", "的视频并查看", "的视频", "并查看"]:
-            if text.endswith(suffix) and len(text) > len(suffix) + 1:
-                candidates.append(text[:-len(suffix)].strip())
-
-        for candidate in candidates:
-            if candidate and candidate in instruction:
-                return candidate
+        # 极其轻量的安全剥离：去除最常见的错误前缀，不要写死城市名
+        for prefix in ["去", "到", "前往", "导航到", "打车到", "搜索", "查找"]:
+            if text.startswith(prefix) and len(text) > len(prefix):
+                candidate = text[len(prefix):].strip()
+                if candidate and candidate in instruction:
+                    return candidate
 
         return text
 
@@ -544,8 +536,37 @@ COMPLETE:[]
         params = params or {}
 
         if action == "CLICK_ID":
-            # 赛题标准输出不要求 CLICK_ID，这里仅做安全退化。
-            return "CLICK", {"point": [500, 500]}, ""
+            # 赛题标准输出要求 CLICK:[[x,y]]，我们在这里拦截 CLICK_ID 并转换为实际归一化坐标
+            element_id = params.get("id", params.get("selected_id", -1))
+            try:
+                element_id = int(element_id)
+            except (ValueError, TypeError):
+                element_id = -1
+
+            if hasattr(self, "current_element_map") and element_id in self.current_element_map:
+                meta = self.current_element_map[element_id]
+                center = None
+
+                # 兼容不同的 element_map 数据结构 (字典结构含 center/bbox，或纯列表)
+                if isinstance(meta, dict):
+                    center = meta.get("center") or meta.get("point")
+                    if not center and "bbox" in meta:
+                        x0, y0, x1, y1 = meta["bbox"]
+                        center = [int((x0 + x1) / 2), int((y0 + y1) / 2)]
+                elif isinstance(meta, (list, tuple)):
+                    if len(meta) == 2:
+                        center = list(meta)
+                    elif len(meta) == 4:
+                        x0, y0, x1, y1 = meta
+                        center = [int((x0 + x1) / 2), int((y0 + y1) / 2)]
+
+                if center:
+                    clipped_point = self._clip_norm_point(center)
+                    return "CLICK", {"point": clipped_point}, f"精确映射控件 ID:{element_id} -> 坐标 {clipped_point}"
+
+            # 如果没找到对应 ID 或者解析失败，退化为屏幕中央点击
+            logger.warning(f"CLICK_ID {element_id} 转换坐标失败，退化为中心点击")
+            return "CLICK", {"point": [500, 500]}, f"ID {element_id} 未找到，兜底点击"
 
         if action == "ENTER":
             if isinstance(params, dict) and "point" in params:
@@ -589,7 +610,15 @@ COMPLETE:[]
             normalized_name = self._normalize_text(app_name)
             normalized_name = self.APP_ALIASES.get(normalized_name, normalized_name)
             if not normalized_name:
-                normalized_name = self._infer_open_app_name(getattr(self, "_current_instruction", "") or "")
+                instruction = getattr(self, "_current_instruction", "") or ""
+                app_candidates = [
+                    "美团", "美团外卖", "去哪儿旅行", "去哪旅行", "百度地图", "高德地图", "腾讯视频", "爱奇艺",
+                    "哔哩哔哩", "Bilibili", "抖音", "快手", "芒果TV", "喜马拉雅", "QQ音乐", "微博",
+                ]
+                for app in app_candidates:
+                    if app in instruction:
+                        normalized_name = self.APP_ALIASES.get(app, app)
+                        break
             if normalized_name:
                 return "OPEN", {"app_name": normalized_name}, ""
             return "CLICK", {"point": [500, 500]}, "OPEN 缺少 app_name，退化为安全点击"
@@ -602,9 +631,27 @@ COMPLETE:[]
 
         return action, params, ""
 
+
     def _build_initial_state(self, input_data: AgentInput) -> WorkflowState:
         task_type, task_slots, flow_flags = self._build_task_profile(input_data.instruction, input_data.history_actions)
-        current_image_url = self._encode_image(input_data.current_image)
+
+        # === 新增：调用 SoM 视觉增强 ===
+        self.current_element_map = {}
+        encoded_image_url = self._encode_image(input_data.current_image)
+        som_image_url = encoded_image_url
+        try:
+            from utils.ui_detector import draw_som_labels
+
+            # 对当前图像进行画框标记，返回 画了框的图片 和 控件字典
+            annotated_img, element_map = draw_som_labels(input_data.current_image)
+            som_image_url = self._encode_image(annotated_img)
+            self.current_element_map = element_map  # 暂存在实例上，供后续 CLICK_ID 转换为坐标使用
+        except Exception as e:
+            logger.warning(f"SoM detection failed: {e}")
+            som_image_url = encoded_image_url
+            self.current_element_map = {}
+        # ================================
+
         state: Dict[str, Any] = {
             "input_data": input_data,
             "plan_instruction": self._plan_instruction,
@@ -614,12 +661,14 @@ COMPLETE:[]
             "task_type": task_type,
             "task_slots": task_slots,
             "flow_flags": flow_flags,
-            "current_image_url": current_image_url,
+            "encoded_image_url": encoded_image_url,
+            "current_image_url": som_image_url,  # <-- 传入带有数字框标记的图片给大模型
             "proposed_action": "",
             "proposed_params": {},
             "model_effect": "",
             "reviewer_feedback": "",
             "retry_count": 0,
+            "review_source": "",
             "raw_output": "",
             "usage": None,
         }
@@ -632,14 +681,21 @@ COMPLETE:[]
         state.update(planner_node(workflow_state, self))
         state.update(actor_node(workflow_state, self))
 
-        while True:
-            state.update(reviewer_node(workflow_state, self))
-            review_payload = read_payload(state, A2AChannels.REVIEW, default={}) or {}
-            verdict = str(review_payload.get("verdict", "")).upper()
-            retry_count = int(review_payload.get("retry_count", state.get("retry_count", 0)))
-            if verdict == "PASS" or state.get("reviewer_feedback") == "PASS" or retry_count > self.REVIEW_MAX_RETRY:
-                break
-            state.update(actor_node(workflow_state, self))
+        action = str(state.get("proposed_action", "")).upper()
+        params = state.get("proposed_params", {}) or {}
+        retry_count = int(state.get("retry_count", 0))
+        if self._should_fast_pass_review(action, params, retry_count):
+            state["reviewer_feedback"] = "PASS"
+            state["review_source"] = "RULE_FAST_PASS"
+        else:
+            while True:
+                state.update(reviewer_node(workflow_state, self))
+                review_payload = read_payload(state, A2AChannels.REVIEW, default={}) or {}
+                verdict = str(review_payload.get("verdict", "")).upper()
+                retry_count = int(review_payload.get("retry_count", state.get("retry_count", 0)))
+                if verdict == "PASS" or state.get("reviewer_feedback") == "PASS" or retry_count > self.REVIEW_MAX_RETRY:
+                    break
+                state.update(actor_node(workflow_state, self))
 
         state.update(format_output_node(workflow_state, self))
         return cast(WorkflowState, cast(object, state))
@@ -694,6 +750,51 @@ COMPLETE:[]
 
         return output
 
+    @staticmethod
+    def _is_valid_norm_point(point: Any) -> bool:
+        if not isinstance(point, list) or len(point) != 2:
+            return False
+        try:
+            x = int(point[0])
+            y = int(point[1])
+        except Exception:
+            return False
+        return 0 <= x <= 1000 and 0 <= y <= 1000
+
+    def _should_fast_pass_review(self, action: str, params: Dict[str, Any], retry_count: int) -> bool:
+        if retry_count > 0:
+            return False
+        action = str(action or "").upper()
+        if action == "CLICK":
+            return self._is_valid_norm_point((params or {}).get("point"))
+        if action == "SCROLL":
+            p = params or {}
+            return self._is_valid_norm_point(p.get("start_point")) and self._is_valid_norm_point(p.get("end_point"))
+        return False
+
+    def _get_step_image_url(self, state: Dict[str, Any], input_data: AgentInput) -> str:
+        current_image_url = str(state.get("current_image_url", "") or "")
+        if current_image_url:
+            return current_image_url
+        encoded_image_url = str(state.get("encoded_image_url", "") or "")
+        if encoded_image_url:
+            return encoded_image_url
+        # 兜底仅编码一次，并回填到 state 供本步多节点复用。
+        encoded_image_url = self._encode_image(input_data.current_image)
+        state["encoded_image_url"] = encoded_image_url
+        state["current_image_url"] = encoded_image_url
+        return encoded_image_url
+
+    def _get_openai_client(self):
+        if self._openai_client is not None:
+            return self._openai_client
+        try:
+            from openai import OpenAI
+        except ImportError:
+            raise ImportError("请安装 openai 包: pip install openai")
+        self._openai_client = OpenAI(base_url=self._api_url, api_key=self._api_key)
+        return self._openai_client
+
     def _call_api(self, messages, **kwargs):
         """Agent-local API wrapper: keep base safety checks but honor runtime kwargs."""
         forbidden_found = []
@@ -719,12 +820,7 @@ COMPLETE:[]
                 "评测已终止。"
             )
 
-        if self._openai_client is None:
-            try:
-                from openai import OpenAI
-            except ImportError:
-                raise ImportError("请安装 openai 包: pip install openai")
-            self._openai_client = OpenAI(base_url=self._api_url, api_key=self._api_key)
+        client = cast(Any, self._get_openai_client())
 
         logger.info(f"[API调用] model={self._model_id}, url={self._api_url}")
 
@@ -733,24 +829,9 @@ COMPLETE:[]
         if isinstance(user_extra_body, dict):
             extra_body.update(user_extra_body)
 
-        client = cast(Any, self._openai_client)
         return client.chat.completions.create(
             model=self._model_id,
             messages=messages,
             extra_body=extra_body,
             **safe_kwargs,
         )
-
-    def _infer_open_app_name(self, instruction: str) -> str:
-        text = instruction or ""
-        for src, target in self.APP_ALIASES.items():
-            if src in text:
-                return target
-
-        candidates = [
-            "百度地图", "美团", "去哪儿旅行", "腾讯视频", "爱奇艺", "哔哩哔哩", "抖音", "快手", "芒果TV", "喜马拉雅",
-        ]
-        for app in candidates:
-            if app in text:
-                return app
-        return ""
