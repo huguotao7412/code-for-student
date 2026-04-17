@@ -5,6 +5,7 @@ from agent_base import AgentInput, AgentOutput, UsageInfo
 
 class WorkflowState(TypedDict, total=False):
     input_data: AgentInput
+    concurrent_actors: List[Dict[str, Any]]
 
     plan_instruction: str
     app_name: str

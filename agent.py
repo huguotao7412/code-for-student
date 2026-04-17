@@ -9,11 +9,12 @@ import hashlib
 import json
 import logging
 import re
+import concurrent.futures
 from typing import Any, Dict, List, Optional, Tuple
 
 try:
     from langgraph.graph import END, START, StateGraph
-except Exception:  # pragma: no cover - fallback for environments without langgraph
+except Exception:
     END = None
     START = None
     StateGraph = None
@@ -29,7 +30,10 @@ logger = logging.getLogger(__name__)
 
 
 class Agent(BaseAgent):
-    """LLM 主导，最小 schema 适配。"""
+    """
+    depth research agent
+    GUI 智能代理 - 基于 A2A 协议与并发 Actor 架构
+    """
 
     VALID_ACTIONS = {"CLICK", "SCROLL", "TYPE", "OPEN", "COMPLETE"}
 
@@ -43,12 +47,13 @@ class Agent(BaseAgent):
 
     def _build_graph(self):
         if StateGraph is None:
-            logger.warning("langgraph is not available, fallback to legacy single-agent runtime")
+            logger.warning("langgraph 不可用，回退到基础模式")
             return None
         workflow = StateGraph(WorkflowState)
 
         workflow.add_node("planner", lambda state: planner_node(state, self))
-        workflow.add_node("actor", lambda state: actor_node(state, self))
+        # Actor 节点现在负责管理并发调度
+        workflow.add_node("actor", lambda state: self._concurrent_actor_executor(state))
         workflow.add_node("reviewer", lambda state: reviewer_node(state, self))
         workflow.add_node("format_output", lambda state: format_output_node(state, self))
 
@@ -62,17 +67,50 @@ class Agent(BaseAgent):
                 return "format_output"
             return "actor"
 
-        workflow.add_conditional_edges(
-            "reviewer",
-            _review_route,
-            {
-                "actor": "actor",
-                "format_output": "format_output",
-            },
-        )
+        workflow.add_conditional_edges("reviewer", _review_route, {"actor": "actor", "format_output": "format_output"})
         workflow.add_edge("format_output", END)
 
         return workflow.compile()
+
+    def _concurrent_actor_executor(self, state: WorkflowState) -> Dict[str, Any]:
+        """
+        根据 Planner 规划的多个 Actor 实例，进行并发的界面分析与决策。
+        """
+        concurrent_actors = state.get("concurrent_actors", [])
+        if not concurrent_actors:
+            # 回退到标准单 Actor
+            return actor_node(state, self)
+
+        logger.info(f"[Actor Executor] 启动并发 Actor 池，数量: {len(concurrent_actors)}")
+
+        results = []
+        # 使用并发执行器同时拉起多个 Actor 实例分析当前截图
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(concurrent_actors)) as executor:
+            # 为了区分不同 Actor 的角色，可以在状态中临时注入角色描述
+            future_to_actor = {}
+            for actor_cfg in concurrent_actors:
+                # 浅拷贝状态并注入专属配置
+                actor_state = dict(state)
+                actor_state["current_actor_role"] = actor_cfg.get("role", "")
+                future = executor.submit(actor_node, actor_state, self)
+                future_to_actor[future] = actor_cfg
+
+            for future in concurrent.futures.as_completed(future_to_actor):
+                try:
+                    res = future.result()
+                    if res and res.get("proposed_action") != "CLICK" or res.get("proposed_params") != {
+                        "point": [500, 500]}:
+                        results.append(res)
+                except Exception as e:
+                    logger.error(f"[Actor Executor] 并发 Actor 发生异常: {e}")
+
+        # 优先选择非兜底的有效动作，交由 Reviewer 裁决
+        if results:
+            best_result = results[0]  # 这里可以加入更复杂的选举逻辑
+            logger.info(f"[Actor Executor] 并发分析完毕，采纳动作: {best_result.get('proposed_action')}")
+            return best_result
+
+        return actor_node(state, self)
 
     def reset(self):
         self.state = GUIState(max_steps=45)
@@ -95,7 +133,6 @@ class Agent(BaseAgent):
             return ""
 
     def _encode_image(self, image: Image.Image, image_format: str = "JPEG") -> str:
-        """叠加坐标网格并压缩图片，提升视觉定位与调用稳定性。"""
         try:
             enhanced_image = add_coordinate_grid(image)
         except Exception as e:
@@ -113,11 +150,9 @@ class Agent(BaseAgent):
         return f"data:image/jpeg;base64,{base64_str}"
 
     def _focus_signature(self, image) -> str:
-        """局部高敏 hash：对输入框常见区域做更细粒度签名，覆盖光标闪烁变化."""
         try:
             gray = image.convert("L")
             w, h = gray.size
-            # 上方搜索区 + 底部键盘区，兼顾输入焦点变化。
             top = gray.crop((0, 0, w, max(1, int(h * 0.34))))
             bottom = gray.crop((0, int(h * 0.70), w, h))
             mix = Image.new("L", (w, top.height + bottom.height))
@@ -128,24 +163,6 @@ class Agent(BaseAgent):
         except Exception:
             return ""
 
-    # App 名称不再通过程序规则匹配，只使用 planner 模型输出（可为空）。
-
-    @staticmethod
-    def _task_by_id(task_plan: List[Dict[str, Any]], task_id: Optional[int]) -> Optional[Dict[str, Any]]:
-        if task_id is None:
-            return None
-        for item in task_plan:
-            if int(item.get("id", -1)) == int(task_id):
-                return item
-        return None
-
-    @staticmethod
-    def _is_play_task(task: Optional[Dict[str, Any]]) -> bool:
-        if not task:
-            return False
-        text = f"{task.get('stage', '')} {task.get('goal', '')}".lower()
-        return any(k in text for k in ["播放", "收听", "观看", "play"])
-
     @staticmethod
     def _next_pending_task(task_plan: List[Dict[str, Any]], completed_tasks: List[int]) -> Optional[Dict[str, Any]]:
         done = set(int(x) for x in completed_tasks)
@@ -154,24 +171,6 @@ class Agent(BaseAgent):
             if tid not in done:
                 return item
         return task_plan[-1] if task_plan else None
-
-    def _build_plan_prompt(self, instruction: str) -> str:
-        return f"""你是 GUI 任务规划器。请先理解任务，再给出一个面向整个样例的顺序计划。
-要求：
-1) 仅输出 JSON，不要解释。
-2) JSON 格式：
-{{
-  "app_name": "目标App名（可为空）",
-  "sub_steps": [
-    {{"id": 1, "stage": "阶段名", "goal": "要完成什么", "action_hint": "OPEN/CLICK/TYPE/SCROLL/COMPLETE"}}
-  ]
-}}
-3) 建议输出 6~8 个子步骤，但可按任务复杂度灵活调整。
-4) 子步骤要可迁移，不依赖固定坐标。
-
-现在请只针对下面任务生成计划：
-任务：{instruction}
-"""
 
     def _plan_to_text(self) -> str:
         if not self._task_plan:
@@ -187,82 +186,15 @@ class Agent(BaseAgent):
             lines.append(f"{mark} {step_id}. {stage} | {goal} | hint={action_hint}")
         return "\\n".join(lines)
 
-    def _parse_plan(self, raw_text: str) -> Tuple[str, List[Dict[str, Any]]]:
-        try:
-            data = json.loads(raw_text)
-            app_name = str(data.get("app_name", "")).strip() if isinstance(data, dict) else ""
-            sub_steps = data.get("sub_steps", []) if isinstance(data, dict) else []
-            parsed: List[Dict[str, Any]] = []
-            for i, item in enumerate(sub_steps, start=1):
-                if not isinstance(item, dict):
-                    continue
-                parsed.append({
-                    "id": int(item.get("id", i)),
-                    "stage": str(item.get("stage", "")).strip(),
-                    "goal": str(item.get("goal", "")).strip(),
-                    "action_hint": str(item.get("action_hint", "")).strip().upper(),
-                })
-            if parsed:
-                parsed = sorted(parsed, key=lambda x: x.get("id", 0))
-                return app_name, parsed
-        except Exception:
-            pass
-
-        return "", [
-            {"id": 1, "stage": "进入应用", "goal": "打开并进入任务主场景", "action_hint": "OPEN"},
-            {"id": 2, "stage": "处理遮挡", "goal": "关闭弹窗或权限提示", "action_hint": "CLICK"},
-            {"id": 3, "stage": "定位入口", "goal": "找到搜索或目标功能入口", "action_hint": "CLICK"},
-            {"id": 4, "stage": "输入与确认", "goal": "输入关键词并确认", "action_hint": "TYPE"},
-            {"id": 5, "stage": "结果处理", "goal": "进入目标结果并完成关键动作", "action_hint": "CLICK"},
-            {"id": 6, "stage": "结束", "goal": "任务完成", "action_hint": "COMPLETE"},
-        ]
-
-    def _ensure_task_plan(self, instruction: str, current_image) -> None:
-        if self._plan_instruction == instruction and self._task_plan:
-            return
-
-        self._plan_instruction = instruction
-        self._task_plan = []
-        self._app_name = ""
-        plan_prompt = self._build_plan_prompt(instruction)
-        messages = [{
-            "role": "user",
-            "content": [
-                {"type": "text", "text": plan_prompt},
-                {"type": "image_url", "image_url": {"url": self._encode_image(current_image)}},
-            ],
-        }]
-        try:
-            response = self._call_api(messages)
-            raw_plan = response.choices[0].message.content
-            parsed_app, parsed_steps = self._parse_plan(raw_plan)
-            self._task_plan = parsed_steps
-            self._app_name = parsed_app
-        except Exception as e:
-            logger.warning(f"Plan generation failed: {e}")
-            parsed_app, parsed_steps = self._parse_plan("")
-            self._task_plan = parsed_steps
-            self._app_name = parsed_app
-        self.state.app_name = self._app_name
-        self.state.task_plan = list(self._task_plan)
-
-    @staticmethod
-    def _recent_completed_tasks(history_actions: list, window: int = 2) -> list:
-        if not history_actions or window <= 0:
-            return []
-        completed = [x.get("id") for x in history_actions if isinstance(x, dict) and x.get("action") == "COMPLETE"]
-        return completed[-window:]
-
-    # ...existing code...
     def _build_prompt(
-        self,
-        instruction: str,
-        history_actions: list,
-        reviewer_feedback: str = "",
-        retry_count: int = 0,
-        app_name: str = "",
-        completed_tasks: Optional[List[int]] = None,
-        active_task: Optional[Dict[str, Any]] = None,
+            self,
+            instruction: str,
+            history_actions: list,
+            reviewer_feedback: str = "",
+            retry_count: int = 0,
+            app_name: str = "",
+            completed_tasks: Optional[List[int]] = None,
+            active_task: Optional[Dict[str, Any]] = None,
     ) -> str:
         self._current_instruction = instruction or ""
         recent = self._recent_history(history_actions, window=2)
@@ -271,6 +203,7 @@ class Agent(BaseAgent):
         active_task_text = "无"
         if active_task:
             active_task_text = f"#{active_task.get('id')} {active_task.get('stage')} | {active_task.get('goal')} | hint={active_task.get('action_hint')}"
+
         review_section = ""
         if reviewer_feedback and reviewer_feedback != "PASS":
             review_section = f"""
@@ -283,11 +216,11 @@ class Agent(BaseAgent):
 任务目标：【{instruction}】
 
 [执行上下文]
-- 目标 App(来自规划器): {app_name or self._app_name or '未知'}
+- 目标 App: {app_name or self._app_name or '未知'}
 - 历史摘要: {self.state.get_summary()}
 - 最近动作: {recent}
 - 步数: {self.state.step_count}/{self.state.max_steps}
-- 总任务列表(面向整个样例):
+- 总任务列表:
 {self._plan_to_text()}
 - 已完成任务ID: {completed_tasks}
 - 未完成任务数: {len(pending)}
@@ -295,18 +228,17 @@ class Agent(BaseAgent):
 {review_section}
 
 [决策建议]
-1) 若当前还未进入目标应用，可优先考虑 OPEN。
-2) TYPE 前优先确认输入框已激活（如光标或键盘可见）。
-3) 输入后优先找页面原生确认/搜索按钮，其次再考虑键盘确认键。
-4) 若当前优先子任务是播放类且界面有播放键，可优先点击播放。
-5) 每轮只输出当前截图最关键的一步。
+1) 若当前还未进入目标应用，优先使用 OPEN 打开目标App。
+2) TYPE 前，必须寻找竖线光标确认输入框已完全激活。
+3) 文本输入完成后，立刻寻找并精准点击页面原生 UI 的确认/搜索按键完成操作。
+4) 若当前优先子任务是播放类且界面有播放键，优先点击原生播放图标。
 
 [合法动作]
 CLICK / TYPE / SCROLL / OPEN / COMPLETE
 
 [输出格式]
 必须严格按以下结构输出（不可遗漏）：
-[State] [State: 当前阶段]
+[State] 当前阶段
 [Observe] 只描述当前屏幕可见事实
 [Analyze] 结合当前状态，判断下一步意图
 [Action] 仅一条动作，格式如下之一：
@@ -324,41 +256,12 @@ COMPLETE:[]
         if "[Action]" in raw_text:
             action_block = raw_text.split("[Action]")[-1].split("[Expected Effect]")[0]
         action, params = robust_parse(action_block)
-        expected_effect = raw_text.split("[Expected Effect]")[-1].strip() if "[Expected Effect]" in raw_text else "画面发生变化"
+        expected_effect = raw_text.split("[Expected Effect]")[
+            -1].strip() if "[Expected Effect]" in raw_text else "画面发生变化"
         return action, params, expected_effect
 
-    @staticmethod
-    def _clip_norm_point(point: list) -> list:
-        if not point or len(point) != 2:
-            return [500, 500]
-        return [max(10, min(990, int(point[0]))), max(10, min(990, int(point[1])))]
-
-    @staticmethod
-    def _normalize_text(text: Any) -> str:
-        raw = "" if text is None else str(text)
-        # 只去掉模型常见外层包装，不碰正文。
-        return raw.strip().strip("'\" ")
-
-    def _self_check_type_text(self, text: str) -> str:
-        """轻量自检：剥离硬编码截断，完全交由大模型判断核心词汇."""
-        text = self._normalize_text(text)
-        instruction = getattr(self, "_current_instruction", "") or ""
-        if not text or not instruction:
-            return text
-
-        # 仅保留对书名号内容的保护补全，防止模型误截断《三体》这类剧名
-        for match in re.findall(r"《[^》]+》[^，。！？；,!?;\n]*", instruction):
-            phrase = match.strip()
-            if text and text in phrase and len(text) < len(phrase):
-                return phrase
-
-        # 原文已出现在指令中，直接保留，不再暴力去尾
-        if text in instruction:
-            return text
-
-        return text
-
-    def _normalize_output(self, action: str, params: dict, som_map: Optional[Dict[int, Dict[str, Any]]] = None) -> Tuple[str, dict, str]:
+    def _normalize_output(self, action: str, params: dict, som_map: Optional[Dict[int, Dict[str, Any]]] = None) -> \
+    Tuple[str, dict, str]:
         params = params or {}
         som_map = som_map or {}
 
@@ -370,119 +273,21 @@ COMPLETE:[]
                 idx = None
             if idx and idx in som_map:
                 center = som_map[idx].get("center", [500, 500])
-                return "CLICK", {"point": self._clip_norm_point(center)}, "根据编号点击目标控件"
+                return "CLICK", {"point": center}, "根据编号点击目标控件"
             return "CLICK", {"point": [500, 500]}, "编号未命中，兜底点击"
-
-        if action == "ENTER":
-            if isinstance(params, dict) and "point" in params:
-                return "CLICK", {"point": self._clip_norm_point(params["point"])}, "确认输入并继续"
-            if isinstance(params, dict) and "x" in params and "y" in params:
-                return "CLICK", {"point": self._clip_norm_point([params["x"], params["y"]])}, "确认输入并继续"
-            # 严格评测中 ENTER 常对应右上角确认/搜索按钮，避免中心兜底误点。
-            return "CLICK", {"point": [900, 80]}, "确认输入并继续"
-
-        if action == "CLICK":
-            if isinstance(params, dict) and "point" in params:
-                return "CLICK", {"point": self._clip_norm_point(params["point"])}, ""
-            if isinstance(params, dict) and "x" in params and "y" in params:
-                return "CLICK", {"point": self._clip_norm_point([params["x"], params["y"]])}, ""
-            return "CLICK", {"point": [500, 500]}, ""
-
-        if action == "TYPE":
-            text = ""
-            if isinstance(params, dict):
-                text = params.get("text", params.get("content", ""))
-            checked = self._self_check_type_text(self._normalize_text(text))
-            return "TYPE", {"text": checked}, ""
-
-        if action == "SCROLL":
-            if isinstance(params, dict):
-                start = params.get("start_point")
-                end = params.get("end_point")
-                points = params.get("points")
-                if (not start or not end) and isinstance(points, list) and len(points) == 2:
-                    start, end = points[0], points[1]
-                if start and end:
-                    return "SCROLL", {
-                        "start_point": self._clip_norm_point(start),
-                        "end_point": self._clip_norm_point(end),
-                    }, ""
-            return "SCROLL", {"start_point": [500, 800], "end_point": [500, 200]}, ""
-
-        if action == "OPEN":
-            app_name = ""
-            if isinstance(params, dict):
-                app_name = params.get("app_name", params.get("app", params.get("content", "")))
-            return "OPEN", {"app_name": self._normalize_text(app_name)}, ""
-
-        if action == "COMPLETE":
-            return "COMPLETE", {}, ""
 
         if action not in self.VALID_ACTIONS:
             return "CLICK", {"point": [500, 500]}, "兜底点击"
 
         return action, params, ""
 
-    def _legacy_act(self, input_data: AgentInput) -> AgentOutput:
-        current_signature = self._image_signature(input_data.current_image)
-
-        if input_data.step_count <= 1 or self._plan_instruction != input_data.instruction:
-            self._ensure_task_plan(input_data.instruction, input_data.current_image)
-
-        prompt = self._build_prompt(input_data.instruction, input_data.history_actions)
-        messages = [{
-            "role": "user",
-            "content": [
-                {"type": "text", "text": prompt},
-                {"type": "image_url", "image_url": {"url": self._encode_image(input_data.current_image)}},
-            ],
-        }]
-
-        raw_output = ""
-        usage = None
-        try:
-            response = self._call_api(messages, temperature=0.0)
-            raw_output = response.choices[0].message.content
-            usage = self.extract_usage_info(response)
-            model_action, model_params, model_effect = self._parse_with_effect(raw_output)
-        except Exception as e:
-            logger.warning(f"Model failed: {e}")
-            model_action, model_params, model_effect = "CLICK", {"point": [500, 500]}, "兜底点击"
-            raw_output = f"Fallback: {e}"
-
-        action, params, expected_effect = self._normalize_output(model_action, model_params)
-
-        last_action = ""
-        if input_data.history_actions:
-            last = input_data.history_actions[-1]
-            if isinstance(last, dict):
-                last_action = str(last.get("action", "")).upper()
-        if last_action == "TYPE" and action == "TYPE":
-            action = "CLICK"
-            params = {"point": [900, 80]}
-            expected_effect = "确认输入并继续"
-
-        if model_effect and not expected_effect:
-            expected_effect = model_effect
-
-        self.state.update(
-            f"{action}:{params}",
-            expected_effect or model_effect or "画面发生变化",
-            visual_hash=current_signature,
-        )
-        self.state.last_image = input_data.current_image.copy()
-
-        return AgentOutput(action=action, parameters=params, raw_output=raw_output, usage=usage)
-
     def act(self, input_data: AgentInput) -> AgentOutput:
         if self.state.should_force_stop():
             return AgentOutput(action="COMPLETE", parameters={}, raw_output="Limit reached")
 
-        if not self.graph:
-            return self._legacy_act(input_data)
-
         current_signature = self._image_signature(input_data.current_image)
         current_focus_signature = self._focus_signature(input_data.current_image)
+
         initial_state: WorkflowState = {
             "input_data": input_data,
             "plan_instruction": self._plan_instruction,
@@ -518,13 +323,14 @@ COMPLETE:[]
                 )
             expected_effect = final_state.get("expected_effect", "画面发生变化")
         except Exception as e:
-            logger.warning(f"Graph invoke failed, fallback to legacy: {e}")
-            return self._legacy_act(input_data)
+            logger.warning(f"Graph invoke failed: {e}")
+            return AgentOutput(action="CLICK", parameters={"point": [500, 500]}, raw_output=f"Error: {e}")
 
         self.state.app_name = final_state.get("app_name", self.state.app_name or self._app_name)
         self.state.task_plan = list(final_state.get("task_plan") or self._task_plan)
         self.state.completed_tasks = list(final_state.get("completed_tasks") or self.state.completed_tasks)
-        self.state.last_completed_update_step = int(final_state.get("last_completed_update_step", self.state.last_completed_update_step))
+        self.state.last_completed_update_step = int(
+            final_state.get("last_completed_update_step", self.state.last_completed_update_step))
 
         self.state.update(
             f"{output.action}:{output.parameters}",
@@ -536,4 +342,3 @@ COMPLETE:[]
         self.state.last_image = input_data.current_image.copy()
 
         return output
-
